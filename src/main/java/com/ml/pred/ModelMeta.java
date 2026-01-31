@@ -14,6 +14,11 @@ public class ModelMeta {
     private Long nUp;
     private Long nDown;
     private Double upRate;
+    private List<Integer> classes;
+    private Integer upClass;
+    private Integer upClassIndex;
+    private List<String> onnxOutputs;
+    private String probOutputName;
     private DecisionPolicy decisionPolicy;
 
     public String getSymbol() {
@@ -94,6 +99,46 @@ public class ModelMeta {
 
     public void setUpRate(Double upRate) {
         this.upRate = upRate;
+    }
+
+    public List<Integer> getClasses() {
+        return classes;
+    }
+
+    public void setClasses(List<Integer> classes) {
+        this.classes = classes;
+    }
+
+    public Integer getUpClass() {
+        return upClass;
+    }
+
+    public void setUpClass(Integer upClass) {
+        this.upClass = upClass;
+    }
+
+    public Integer getUpClassIndex() {
+        return upClassIndex;
+    }
+
+    public void setUpClassIndex(Integer upClassIndex) {
+        this.upClassIndex = upClassIndex;
+    }
+
+    public List<String> getOnnxOutputs() {
+        return onnxOutputs;
+    }
+
+    public void setOnnxOutputs(List<String> onnxOutputs) {
+        this.onnxOutputs = onnxOutputs;
+    }
+
+    public String getProbOutputName() {
+        return probOutputName;
+    }
+
+    public void setProbOutputName(String probOutputName) {
+        this.probOutputName = probOutputName;
     }
 
     public DecisionPolicy getDecisionPolicy() {

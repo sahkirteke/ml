@@ -9,10 +9,14 @@ import java.nio.FloatBuffer;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 @Component
 public class OnnxInferenceService {
+    private static final Logger log = LoggerFactory.getLogger(OnnxInferenceService.class);
+
     public Optional<Double> predict(FeatureRecord record, OnnxModelLoader.ModelBundle model) throws OrtException {
         if (model == null || model.getSession() == null || model.getMeta() == null) {
             return Optional.empty();
@@ -28,7 +32,8 @@ public class OnnxInferenceService {
                 FloatBuffer.wrap(inputs),
                 new long[] {1, inputs.length});
              OrtSession.Result result = model.getSession().run(Map.of(inputName, tensor))) {
-            return Optional.of(extractProbability(result));
+            String probOutput = resolveProbOutputName(meta, model);
+            return Optional.of(extractProbability(result, probOutput, meta.getUpClassIndex()));
         }
     }
 
@@ -66,24 +71,35 @@ public class OnnxInferenceService {
         };
     }
 
-    private double extractProbability(OrtSession.Result result) throws OrtException {
-        for (Map.Entry<String, OnnxValue> entry : result) {
-            OnnxValue value = entry.getValue();
-            if (value instanceof OnnxTensor tensor) {
-                Object raw = tensor.getValue();
-                if (raw instanceof float[][] matrix && matrix.length > 0) {
-                    float[] row = matrix[0];
-                    if (row.length >= 2) {
-                        return row[1];
-                    }
-                    if (row.length == 1) {
-                        return row[0];
-                    }
-                } else if (raw instanceof float[] vector && vector.length > 0) {
-                    return vector.length >= 2 ? vector[1] : vector[0];
+    private String resolveProbOutputName(ModelMeta meta, OnnxModelLoader.ModelBundle model) {
+        if (meta.getProbOutputName() != null && model.getSession().getOutputNames().contains(meta.getProbOutputName())) {
+            return meta.getProbOutputName();
+        }
+        if (model.getSession().getOutputNames().contains("probabilities")) {
+            return "probabilities";
+        }
+        return model.getSession().getOutputNames().iterator().next();
+    }
+
+    private double extractProbability(OrtSession.Result result, String outputName, Integer upClassIndex)
+            throws OrtException {
+        int index = upClassIndex == null ? 1 : upClassIndex;
+        OnnxValue value = result.get(outputName);
+        if (value instanceof OnnxTensor tensor) {
+            Object raw = tensor.getValue();
+            if (raw instanceof float[][] matrix && matrix.length > 0) {
+                float[] row = matrix[0];
+                if (row.length > index) {
+                    return row[index];
                 }
+                if (row.length == 1) {
+                    return row[0];
+                }
+            } else if (raw instanceof float[] vector && vector.length > 0) {
+                return vector.length > index ? vector[index] : vector[0];
             }
         }
+        log.info("ONNX_OUTPUT_MISMATCH outputName={} upClassIndex={}", outputName, index);
         return 0.0d;
     }
 }

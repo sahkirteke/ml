@@ -55,6 +55,8 @@ public class RawIngestionProperties {
 
     private DecisionProperties decision = new DecisionProperties();
 
+    private boolean smokeTestEnabled = false;
+
     public List<String> getSymbols() {
         return symbols;
     }
@@ -173,6 +175,14 @@ public class RawIngestionProperties {
 
     public void setDecision(DecisionProperties decision) {
         this.decision = decision;
+    }
+
+    public boolean isSmokeTestEnabled() {
+        return smokeTestEnabled;
+    }
+
+    public void setSmokeTestEnabled(boolean smokeTestEnabled) {
+        this.smokeTestEnabled = smokeTestEnabled;
     }
 
     public static class DecisionProperties {

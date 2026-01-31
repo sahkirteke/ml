@@ -204,6 +204,8 @@ def write_meta(
     classes: list[int],
     up_class_index: int,
     feature_order: list[str],
+    onnx_outputs: list[str],
+    prob_output_name: str | None,
 ) -> None:
     def _json_default(o):
         if isinstance(o, np.integer):
@@ -236,6 +238,8 @@ def write_meta(
         "classes": classes,
         "upClass": 1,
         "upClassIndex": up_class_index,
+        "onnxOutputs": onnx_outputs,
+        "probOutputName": prob_output_name,
         "decisionPolicy": {
             "minConfidence": 0.55,
             "minAbsExpectedPct": 0.05,
@@ -349,6 +353,7 @@ def main() -> None:
             export_model = base_pipeline
             input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
             print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
+        prob_output_name = "probabilities" if "probabilities" in output_names else None
         if export_model is base_pipeline:
             onnx_checked = False
         else:
@@ -392,6 +397,8 @@ def main() -> None:
             classes,
             up_class_index,
             feature_order,
+            output_names,
+            prob_output_name,
         )
         write_current(model_dir, args.out_dir, symbol)
         wrote_path = args.out_dir / symbol / "current"
