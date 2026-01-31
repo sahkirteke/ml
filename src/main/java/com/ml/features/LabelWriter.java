@@ -27,7 +27,7 @@ public class LabelWriter {
         try {
             Path file = appender.appendLabel(record);
             String partition = partitionResolver.resolveDate(record.getCloseTimeMs());
-            log.debug("LABEL_WRITE symbol={} closeTimeMs={} partition={} labelUp={}",
+            log.info("LABEL_WRITE symbol={} closeTimeMs={} partition={} labelUp={}",
                     record.getSymbol(),
                     record.getCloseTimeMs(),
                     partition,

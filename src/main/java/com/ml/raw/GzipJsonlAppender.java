@@ -37,7 +37,7 @@ public class GzipJsonlAppender {
     public Path append(RawRecord record) throws IOException {
         Path file = appendPayload("raw", record.getSymbol(), record.getCloseTimeMs(), record);
         String partition = partitionResolver.resolveDate(record.getCloseTimeMs());
-        log.debug("RAW_WRITE symbol={} closeTimeMs={} partition={}",
+        log.info("RAW_WRITE symbol={} closeTimeMs={} partition={}",
                 record.getSymbol(),
                 record.getCloseTimeMs(),
                 partition);
