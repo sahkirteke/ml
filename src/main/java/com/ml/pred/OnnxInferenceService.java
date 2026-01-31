@@ -2,8 +2,8 @@ package com.ml.pred;
 
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OnnxValue;
+import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtException;
-import ai.onnxruntime.OrtSession;
 import com.ml.features.FeatureRecord;
 import java.nio.FloatBuffer;
 import java.util.List;
@@ -13,34 +13,21 @@ import org.springframework.stereotype.Component;
 
 @Component
 public class OnnxInferenceService {
-
-    private final OnnxModelLoader modelLoader;
-
-    public OnnxInferenceService(OnnxModelLoader modelLoader) {
-        this.modelLoader = modelLoader;
-    }
-
-    public boolean isAvailable() {
-        return modelLoader.isLoaded();
-    }
-
-    public Optional<Double> predict(FeatureRecord record) throws OrtException {
-        Optional<OrtSession> sessionOpt = modelLoader.getSession();
-        Optional<ModelMeta> metaOpt = modelLoader.getMeta();
-        Optional<ai.onnxruntime.OrtEnvironment> envOpt = modelLoader.getEnvironment();
-        if (sessionOpt.isEmpty() || metaOpt.isEmpty() || envOpt.isEmpty()) {
+    public Optional<Double> predict(FeatureRecord record, OnnxModelLoader.ModelBundle model) throws OrtException {
+        if (model == null || model.getSession() == null || model.getMeta() == null) {
             return Optional.empty();
         }
-        ModelMeta meta = metaOpt.get();
+        ModelMeta meta = model.getMeta();
         List<String> order = meta.getFeatureOrder();
         if (order == null || order.isEmpty()) {
             return Optional.empty();
         }
         float[] inputs = buildInputs(record, order);
-        OrtSession session = sessionOpt.get();
-        String inputName = session.getInputNames().iterator().next();
-        try (OnnxTensor tensor = OnnxTensor.createTensor(envOpt.get(), FloatBuffer.wrap(inputs), new long[] {1, inputs.length});
-             OrtSession.Result result = session.run(Map.of(inputName, tensor))) {
+        String inputName = model.getSession().getInputNames().iterator().next();
+        try (OnnxTensor tensor = OnnxTensor.createTensor(OrtEnvironment.getEnvironment(),
+                FloatBuffer.wrap(inputs),
+                new long[] {1, inputs.length});
+             OrtSession.Result result = model.getSession().run(Map.of(inputName, tensor))) {
             return Optional.of(extractProbability(result));
         }
     }

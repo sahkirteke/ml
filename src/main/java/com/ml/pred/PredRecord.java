@@ -16,6 +16,7 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
         "confidence",
         "expectedPct",
         "decision",
+        "decisionReason",
         "loggedAtMs",
         "loggedAt"
 })
@@ -32,6 +33,7 @@ public class PredRecord {
     private Double confidence;
     private Double expectedPct;
     private String decision;
+    private String decisionReason;
     private long loggedAtMs;
     private String loggedAt;
 
@@ -123,6 +125,14 @@ public class PredRecord {
         this.decision = decision;
     }
 
+    public String getDecisionReason() {
+        return decisionReason;
+    }
+
+    public void setDecisionReason(String decisionReason) {
+        this.decisionReason = decisionReason;
+    }
+
     public long getLoggedAtMs() {
         return loggedAtMs;
     }
@@ -138,4 +148,5 @@ public class PredRecord {
     public void setLoggedAt(String loggedAt) {
         this.loggedAt = loggedAt;
     }
+
 }

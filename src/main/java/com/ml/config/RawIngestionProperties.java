@@ -39,7 +39,7 @@ public class RawIngestionProperties {
     private Path trainDir = Path.of("data", "train");
 
     @NotNull
-    private Path modelDir = Path.of(System.getProperty("user.dir"), "models", "current");
+    private Path modelsBaseDir = Path.of(System.getProperty("user.dir"), "models");
 
     @NotNull
     private Long expectedGapMs = 300_000L;
@@ -52,6 +52,8 @@ public class RawIngestionProperties {
 
     @NotNull
     private BigDecimal eps = new BigDecimal("1e-12");
+
+    private DecisionProperties decision = new DecisionProperties();
 
     public List<String> getSymbols() {
         return symbols;
@@ -117,12 +119,12 @@ public class RawIngestionProperties {
         this.trainDir = trainDir;
     }
 
-    public Path getModelDir() {
-        return modelDir;
+    public Path getModelsBaseDir() {
+        return modelsBaseDir;
     }
 
-    public void setModelDir(Path modelDir) {
-        this.modelDir = modelDir;
+    public void setModelsBaseDir(Path modelsBaseDir) {
+        this.modelsBaseDir = modelsBaseDir;
     }
 
     public Long getExpectedGapMs() {
@@ -163,5 +165,34 @@ public class RawIngestionProperties {
 
     public void setEps(BigDecimal eps) {
         this.eps = eps;
+    }
+
+    public DecisionProperties getDecision() {
+        return decision;
+    }
+
+    public void setDecision(DecisionProperties decision) {
+        this.decision = decision;
+    }
+
+    public static class DecisionProperties {
+        private Double minConfidence = 0.55d;
+        private Double minAbsExpectedPct = 0.05d;
+
+        public Double getMinConfidence() {
+            return minConfidence;
+        }
+
+        public void setMinConfidence(Double minConfidence) {
+            this.minConfidence = minConfidence;
+        }
+
+        public Double getMinAbsExpectedPct() {
+            return minAbsExpectedPct;
+        }
+
+        public void setMinAbsExpectedPct(Double minAbsExpectedPct) {
+            this.minAbsExpectedPct = minAbsExpectedPct;
+        }
     }
 }

@@ -4,6 +4,7 @@ import java.util.List;
 
 public class ModelMeta {
 
+    private String symbol;
     private String modelVersion;
     private String featuresVersion;
     private List<String> featureOrder;
@@ -12,6 +13,16 @@ public class ModelMeta {
     private Double meanRetDown;
     private Long nUp;
     private Long nDown;
+    private Double upRate;
+    private DecisionPolicy decisionPolicy;
+
+    public String getSymbol() {
+        return symbol;
+    }
+
+    public void setSymbol(String symbol) {
+        this.symbol = symbol;
+    }
 
     public String getModelVersion() {
         return modelVersion;
@@ -75,5 +86,51 @@ public class ModelMeta {
 
     public void setNDown(Long nDown) {
         this.nDown = nDown;
+    }
+
+    public Double getUpRate() {
+        return upRate;
+    }
+
+    public void setUpRate(Double upRate) {
+        this.upRate = upRate;
+    }
+
+    public DecisionPolicy getDecisionPolicy() {
+        return decisionPolicy;
+    }
+
+    public void setDecisionPolicy(DecisionPolicy decisionPolicy) {
+        this.decisionPolicy = decisionPolicy;
+    }
+
+    public static class DecisionPolicy {
+        private Double minConfidence;
+        private Double minAbsExpectedPct;
+        private String mode;
+
+        public Double getMinConfidence() {
+            return minConfidence;
+        }
+
+        public void setMinConfidence(Double minConfidence) {
+            this.minConfidence = minConfidence;
+        }
+
+        public Double getMinAbsExpectedPct() {
+            return minAbsExpectedPct;
+        }
+
+        public void setMinAbsExpectedPct(Double minAbsExpectedPct) {
+            this.minAbsExpectedPct = minAbsExpectedPct;
+        }
+
+        public String getMode() {
+            return mode;
+        }
+
+        public void setMode(String mode) {
+            this.mode = mode;
+        }
     }
 }
