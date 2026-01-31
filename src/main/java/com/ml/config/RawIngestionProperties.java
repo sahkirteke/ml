@@ -24,13 +24,13 @@ public class RawIngestionProperties {
     private Path dataDir = Path.of("data");
 
     @NotNull
-    private ZoneId partitionZone = ZoneId.of("UTC");
+    private ZoneId partitionZone = ZoneId.of("Europe/Istanbul");
 
     @NotNull
     private Integer warmupBars = 500;
 
     @NotBlank
-    private String featuresVersion = "ftr_5m_v1";
+    private String featuresVersion = "v1";
 
     @NotNull
     private BigDecimal eps = new BigDecimal("1e-12");

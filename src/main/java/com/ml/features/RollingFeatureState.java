@@ -32,7 +32,9 @@ public class RollingFeatureState {
             return;
         }
         Bar bar = new Bar(
+                record.getOpenTimeMs(),
                 record.getCloseTimeMs(),
+                record.getEventTimeMs(),
                 parseDouble(record.getOpenPrice()),
                 parseDouble(record.getHighPrice()),
                 parseDouble(record.getLowPrice()),
@@ -74,7 +76,9 @@ public class RollingFeatureState {
     }
 
     public static final class Bar {
+        private final long openTimeMs;
         private final long closeTimeMs;
+        private final long eventTimeMs;
         private final double open;
         private final double high;
         private final double low;
@@ -84,7 +88,9 @@ public class RollingFeatureState {
         private final double buySellRatio;
         private final double deltaBaseVol;
 
-        public Bar(long closeTimeMs,
+        public Bar(long openTimeMs,
+                   long closeTimeMs,
+                   long eventTimeMs,
                    double open,
                    double high,
                    double low,
@@ -93,7 +99,9 @@ public class RollingFeatureState {
                    long tradeCount,
                    double buySellRatio,
                    double deltaBaseVol) {
+            this.openTimeMs = openTimeMs;
             this.closeTimeMs = closeTimeMs;
+            this.eventTimeMs = eventTimeMs;
             this.open = open;
             this.high = high;
             this.low = low;
@@ -104,8 +112,16 @@ public class RollingFeatureState {
             this.deltaBaseVol = deltaBaseVol;
         }
 
+        public long getOpenTimeMs() {
+            return openTimeMs;
+        }
+
         public long getCloseTimeMs() {
             return closeTimeMs;
+        }
+
+        public long getEventTimeMs() {
+            return eventTimeMs;
         }
 
         public double getOpen() {

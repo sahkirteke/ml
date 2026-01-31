@@ -6,7 +6,7 @@ ml:
     - XRPUSDT
   tf: 5m
   data-dir: data
-  partition-zone: UTC
+  partition-zone: Europe/Istanbul
   warmup-bars: 500
-  features-version: ftr_5m_v1
+  features-version: v1
   eps: 1e-12

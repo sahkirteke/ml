@@ -1,5 +1,6 @@
 package com.ml.features;
 
+import com.ml.raw.DailyPartitionResolver;
 import com.ml.raw.GzipJsonlAppender;
 import java.nio.file.Path;
 import org.slf4j.Logger;
@@ -12,9 +13,11 @@ public class LabelWriter {
     private static final Logger log = LoggerFactory.getLogger(LabelWriter.class);
 
     private final GzipJsonlAppender appender;
+    private final DailyPartitionResolver partitionResolver;
 
-    public LabelWriter(GzipJsonlAppender appender) {
+    public LabelWriter(GzipJsonlAppender appender, DailyPartitionResolver partitionResolver) {
         this.appender = appender;
+        this.partitionResolver = partitionResolver;
     }
 
     public Path append(LabelRecord record) {
@@ -23,11 +26,12 @@ public class LabelWriter {
         }
         try {
             Path file = appender.appendLabel(record);
-            log.info("LABEL_WRITE symbol={} closeTimeMs={} file={} labelUp={}",
+            String partition = partitionResolver.resolveDate(record.getCloseTimeMs());
+            log.debug("LABEL_WRITE symbol={} closeTimeMs={} partition={} labelValid={}",
                     record.getSymbol(),
                     record.getCloseTimeMs(),
-                    file,
-                    record.getLabelUp());
+                    partition,
+                    record.isLabelValid());
             return file;
         } catch (Exception ex) {
             throw new RuntimeException(ex);

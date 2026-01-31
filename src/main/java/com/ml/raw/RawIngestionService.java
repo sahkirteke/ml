@@ -91,12 +91,16 @@ public class RawIngestionService implements ApplicationRunner {
             try {
                 appender.append(record);
                 RollingFeatureState state = stateRegistry.getOrCreate(symbol);
+                LabelRecord labelRecord = buildLabel(state, record);
+                if (labelRecord != null
+                        && symbolState.updateLabelsIfNewer(symbol, labelRecord.getCloseTimeMs())) {
+                    labelWriter.append(labelRecord);
+                }
                 state.add(record);
                 FeatureRecord featureRecord = featureCalculator.calculate(state);
-                featureWriter.append(featureRecord);
-                LabelRecord labelRecord = buildLabel(state, record);
-                if (labelRecord != null) {
-                    labelWriter.append(labelRecord);
+                if (featureRecord != null
+                        && symbolState.updateFeaturesIfNewer(symbol, featureRecord.getCloseTimeMs())) {
+                    featureWriter.append(featureRecord);
                 }
             } catch (Exception ex) {
                 throw new RuntimeException(ex);
@@ -105,7 +109,7 @@ public class RawIngestionService implements ApplicationRunner {
     }
 
     private LabelRecord buildLabel(RollingFeatureState state, RawRecord current) {
-        RollingFeatureState.Bar previous = state.getPrevious();
+        RollingFeatureState.Bar previous = state.getLatest();
         if (previous == null) {
             return null;
         }
@@ -113,16 +117,34 @@ public class RawIngestionService implements ApplicationRunner {
         if (prevClose == 0.0d) {
             return null;
         }
-        double currentClose = state.getLatest() == null ? 0.0d : state.getLatest().getClose();
+        double currentClose = parseDouble(current.getClosePrice());
+        if (currentClose == 0.0d) {
+            return null;
+        }
         double futureRet = currentClose / prevClose - 1.0d;
+        long expectedGap = 300_000L;
+        long gapMs = current.getCloseTimeMs() - previous.getCloseTimeMs();
         LabelRecord label = new LabelRecord();
         label.setSymbol(current.getSymbol());
-        label.setTf(current.getTf());
         label.setCloseTimeMs(previous.getCloseTimeMs());
-        label.setLabelType("next_close_direction");
+        label.setFutureCloseTimeMs(current.getCloseTimeMs());
         label.setFutureRet_1(futureRet);
-        label.setLabelUp(futureRet > 0.0d ? 1 : 0);
+        label.setLabelUp(futureRet > 0.0d);
+        label.setExpectedGapMs(expectedGap);
+        label.setGapMs(gapMs);
+        label.setLabelValid(gapMs == expectedGap);
         return label;
+    }
+
+    private double parseDouble(String value) {
+        if (value == null || value.isBlank()) {
+            return 0.0d;
+        }
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException ex) {
+            return 0.0d;
+        }
     }
 
     private boolean isFinalKline(WsEnvelope envelope) {

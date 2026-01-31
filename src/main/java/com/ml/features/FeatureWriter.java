@@ -1,5 +1,6 @@
 package com.ml.features;
 
+import com.ml.raw.DailyPartitionResolver;
 import com.ml.raw.GzipJsonlAppender;
 import java.nio.file.Path;
 import org.slf4j.Logger;
@@ -12,9 +13,11 @@ public class FeatureWriter {
     private static final Logger log = LoggerFactory.getLogger(FeatureWriter.class);
 
     private final GzipJsonlAppender appender;
+    private final DailyPartitionResolver partitionResolver;
 
-    public FeatureWriter(GzipJsonlAppender appender) {
+    public FeatureWriter(GzipJsonlAppender appender, DailyPartitionResolver partitionResolver) {
         this.appender = appender;
+        this.partitionResolver = partitionResolver;
     }
 
     public Path append(FeatureRecord record) {
@@ -23,10 +26,11 @@ public class FeatureWriter {
         }
         try {
             Path file = appender.appendFeature(record);
-            log.info("FEATURE_WRITE symbol={} closeTimeMs={} file={} windowReady={}",
+            String partition = partitionResolver.resolveDate(record.getCloseTimeMs());
+            log.debug("FEATURE_WRITE symbol={} closeTimeMs={} partition={} windowReady={}",
                     record.getSymbol(),
                     record.getCloseTimeMs(),
-                    file,
+                    partition,
                     record.isWindowReady());
             return file;
         } catch (Exception ex) {
