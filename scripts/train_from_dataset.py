@@ -845,12 +845,29 @@ def main() -> None:
                 x_check = x.iloc[:256].to_numpy(dtype=np.float32)
                 outputs = sess.run(None, {input_name: x_check})
                 if outputs:
-                    onnx_probs = np.array(outputs[0])
-                    if onnx_probs.ndim >= 2 and onnx_probs.shape[1] == len(classes):
-                        mean_conf = float(np.mean(np.max(onnx_probs, axis=1)))
-                        print(f"ONNX_CHECK symbol={symbol} meanMaxProb={mean_conf:.6f}")
+                    prob_output = None
+                    label_output = None
+                    for output in outputs:
+                        arr = np.array(output)
+                        if arr.ndim == 1 and arr.shape[0] == 2:
+                            prob_output = arr
+                        elif arr.ndim == 2 and arr.shape[1] == 2:
+                            prob_output = arr
+                        elif arr.ndim == 1 or arr.ndim == 2:
+                            label_output = arr
+                    if prob_output is None:
+                        print(f"WARN_ONNX_MISMATCH symbol={symbol} reason=missing_probabilities")
                     else:
-                        print(f"WARN_ONNX_MISMATCH symbol={symbol} reason=unexpected_output_shape")
+                        if prob_output.ndim == 1:
+                            p_hit = float(prob_output[1])
+                            mean_conf = float(np.max(prob_output))
+                        else:
+                            p_hit = float(prob_output[0, 1])
+                            mean_conf = float(np.mean(np.max(prob_output, axis=1)))
+                        print(f"ONNX_CHECK symbol={symbol} meanMaxProb={mean_conf:.6f}")
+                        print(f"PRED symbol={symbol} pHit={p_hit:.6f}")
+                    if label_output is not None and label_output.ndim == 2 and label_output.shape[1] == 1:
+                        _ = label_output.ravel()
                 else:
                     print(f"WARN_ONNX_MISMATCH symbol={symbol} reason=no_outputs")
             except Exception as exc:
