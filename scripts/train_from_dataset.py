@@ -55,6 +55,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols", default=None, help="Comma-separated symbols to include")
     parser.add_argument("--min-rows-per-symbol", default=20000, type=int, help="Minimum rows required to train")
     parser.add_argument("--calibrate", action="store_true", help="Enable probability calibration")
+    parser.add_argument("--test-rows", default=100000, type=int, help="Rows to use for evaluation test block")
+    parser.add_argument(
+        "--train-grid",
+        default="100000,200000,300000,400000",
+        help="Comma-separated train row sizes to evaluate",
+    )
+    parser.add_argument("--eval-only", action="store_true", help="Only run evaluation without ONNX export")
+    parser.add_argument("--fast-tail", action="store_true", help="Read only the newest daily files if possible")
     return parser.parse_args()
 
 
@@ -96,6 +104,22 @@ def extract_dates(paths: Iterable[Path]) -> set[str]:
     return dates
 
 
+def tail_files_by_days(paths: list[Path], days: int) -> list[Path]:
+    if days <= 0:
+        return paths
+    pattern = re.compile(r"-(\d{8})\.jsonl\.gz$")
+    dated: list[tuple[str, Path]] = []
+    for path in paths:
+        match = pattern.search(path.name)
+        if match:
+            dated.append((match.group(1), path))
+    if not dated:
+        return paths
+    dated.sort(key=lambda item: item[0])
+    keep = dated[-days:]
+    return [path for _, path in keep]
+
+
 def resolve_istanbul_tz():
     try:
         from zoneinfo import ZoneInfo
@@ -114,6 +138,8 @@ def load_features_labels(
     symbol: str,
     *,
     exclude_today: bool,
+    fast_tail: bool = False,
+    fast_tail_days: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[Path], list[Path]]:
     features_root = data_dir / "features" / symbol
     labels_root = data_dir / "labels" / symbol
@@ -125,6 +151,14 @@ def load_features_labels(
         labels_root,
         exclude_today=exclude_today,
     )
+    if fast_tail and fast_tail_days:
+        feature_files = tail_files_by_days(feature_files, fast_tail_days)
+        label_files = tail_files_by_days(label_files, fast_tail_days)
+        print(
+            "FAST_TAIL symbol={} days={} features_files={} labels_files={}".format(
+                symbol, fast_tail_days, len(feature_files), len(label_files)
+            )
+        )
     if not feature_files or not label_files:
         return pd.DataFrame(), pd.DataFrame(), feature_files, label_files
     feature_frames = [read_jsonl_gz(path) for path in feature_files]
@@ -175,6 +209,50 @@ def build_pipeline(solver: str) -> Pipeline:
     return Pipeline(base_steps + [("classifier", lr)])
 
 
+def parse_train_grid(value: str) -> list[int]:
+    items: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        items.append(int(part))
+    return sorted(set(items))
+
+
+def fit_model(
+    x: pd.DataFrame, y: pd.Series, calibrate: bool, symbol: str
+) -> tuple[Pipeline, Pipeline | None, list[int]]:
+    base_pipeline = build_pipeline("lbfgs")
+    print(
+        "MODEL_CONFIG symbol={} solver=lbfgs max_iter=4000 scaler=StandardScaler rows={}".format(
+            symbol, len(x)
+        )
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ConvergenceWarning)
+        base_pipeline.fit(x, y)
+    has_convergence_warning = any(
+        isinstance(warning.message, ConvergenceWarning) for warning in caught
+    )
+    if has_convergence_warning:
+        print("WARN_CONVERGENCE symbol={} solver=lbfgs fallback_solver=saga".format(symbol))
+        base_pipeline = build_pipeline("saga")
+        print(
+            "MODEL_CONFIG symbol={} solver=saga max_iter=4000 scaler=StandardScaler rows={}".format(
+                symbol, len(x)
+            )
+        )
+        base_pipeline.fit(x, y)
+    calibrated = None
+    if calibrate:
+        tscv = TimeSeriesSplit(n_splits=3)
+        calibrated = CalibratedClassifierCV(estimator=base_pipeline, method="sigmoid", cv=tscv)
+        calibrated.fit(x, y)
+    classifier = base_pipeline.named_steps["classifier"]
+    classes = list(getattr(classifier, "classes_", []))
+    return base_pipeline, calibrated, classes
+
+
 def export_onnx(model, feature_count: int, output_path: Path) -> tuple[list[str], list[str]]:
     initial_type = [("input", FloatTensorType([None, feature_count]))]
     onnx_model = convert_sklearn(
@@ -206,6 +284,11 @@ def write_meta(
     feature_order: list[str],
     onnx_outputs: list[str],
     prob_output_name: str | None,
+    last_eval_best_train_rows: int | None = None,
+    last_eval_acc_hi: float | None = None,
+    last_eval_coverage: float | None = None,
+    last_eval_acc_all: float | None = None,
+    last_eval_test_rows: int | None = None,
 ) -> None:
     def _json_default(o):
         if isinstance(o, np.integer):
@@ -240,6 +323,11 @@ def write_meta(
         "upClassIndex": up_class_index,
         "onnxOutputs": onnx_outputs,
         "probOutputName": prob_output_name,
+        "lastEvalBestTrainRows": last_eval_best_train_rows,
+        "lastEvalAccHi": last_eval_acc_hi,
+        "lastEvalCoverage": last_eval_coverage,
+        "lastEvalAccAll": last_eval_acc_all,
+        "lastEvalTestRows": last_eval_test_rows,
         "decisionPolicy": {
             "minConfidence": 0.55,
             "minAbsExpectedPct": 0.002,
@@ -271,6 +359,17 @@ def write_current(model_dir: Path, out_dir: Path, symbol: str) -> None:
 
 def main() -> None:
     args = parse_args()
+    train_sizes = parse_train_grid(args.train_grid)
+    if not train_sizes:
+        raise RuntimeError("train-grid must include at least one train size")
+    max_train = max(train_sizes)
+    test_rows = args.test_rows
+    if test_rows <= 0:
+        raise RuntimeError("test-rows must be > 0")
+    fast_tail_days = None
+    if args.fast_tail:
+        need = max_train + test_rows + 10000
+        fast_tail_days = int(np.ceil(need / 288.0)) + 5
     if args.symbols:
         symbols = [value.strip().upper() for value in args.symbols.split(",") if value.strip()]
     else:
@@ -283,76 +382,174 @@ def main() -> None:
             args.data_dir,
             symbol,
             exclude_today=args.exclude_today,
+            fast_tail=args.fast_tail,
+            fast_tail_days=fast_tail_days,
         )
         if features.empty or labels.empty:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
             continue
         x, y, merged, feature_order = build_training_frame(features, labels)
-        if len(x) < args.min_rows_per_symbol:
-            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} min={args.min_rows_per_symbol}")
+        frame = merged.sort_values("closeTimeMs")
+        frame = frame[frame["windowReady"] == True]
+        x_all = x.loc[frame.index]
+        y_all = y.loc[frame.index]
+        if len(frame) < args.min_rows_per_symbol:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(frame)} min={args.min_rows_per_symbol}")
             continue
-        up_mask = merged["labelUp"] == 1
-        down_mask = merged["labelUp"] == 0
+        need_rows = max_train + test_rows
+        if len(frame) < need_rows:
+            print(
+                "SKIP_EVAL_NOT_ENOUGH_ROWS symbol={} rows={} need={}".format(
+                    symbol, len(frame), need_rows
+                )
+            )
+            continue
+        frame_tail = frame.tail(need_rows)
+        x_tail = x_all.loc[frame_tail.index]
+        y_tail = y_all.loc[frame_tail.index]
+        test_start = len(frame_tail) - test_rows
+        test_end = len(frame_tail)
+        results: list[dict[str, float | int]] = []
+        for train_size in train_sizes:
+            train_start = len(frame_tail) - test_rows - train_size
+            if train_start < 0:
+                print(
+                    "SKIP_EVAL_NOT_ENOUGH_ROWS symbol={} rows={} need={}".format(
+                        symbol, len(frame_tail), train_size + test_rows
+                    )
+                )
+                continue
+            x_train = x_tail.iloc[train_start:test_start]
+            y_train = y_tail.iloc[train_start:test_start]
+            x_test = x_tail.iloc[test_start:test_end]
+            y_test = y_tail.iloc[test_start:test_end]
+            base_pipeline, calibrated, classes = fit_model(x_train, y_train, args.calibrate, symbol)
+            model_for_eval = calibrated if calibrated is not None else base_pipeline
+            if not classes:
+                raise RuntimeError(f"No classes_ found for symbol {symbol}")
+            if 1 not in classes:
+                raise RuntimeError(f"UP class (1) missing in classes for symbol {symbol}: {classes}")
+            up_class_index = classes.index(1)
+            y_pred = model_for_eval.predict(x_test)
+            proba = model_for_eval.predict_proba(x_test)
+            pUp = proba[:, up_class_index]
+            confidence = np.maximum(pUp, 1 - pUp)
+            mask = confidence >= 0.55
+            coverage = float(np.mean(mask)) if len(mask) > 0 else 0.0
+            acc_all = float(np.mean(y_pred == y_test))
+            tp = int(np.sum((y_pred == 1) & (y_test == 1)))
+            tn = int(np.sum((y_pred == 0) & (y_test == 0)))
+            fp = int(np.sum((y_pred == 1) & (y_test == 0)))
+            fn = int(np.sum((y_pred == 0) & (y_test == 1)))
+            up_rec = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+            down_rec = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+            up_rate_test = float(np.mean(y_test))
+            if mask.any():
+                acc_highconf = float(np.mean(y_pred[mask] == y_test[mask]))
+            else:
+                acc_highconf = float("nan")
+                print(f"WARN_EVAL_EMPTY_MASK symbol={symbol} train={train_size}")
+            print(
+                "EVAL symbol={} train={} test={} acc={:.3f} upRec={:.3f} downRec={:.3f} coverage={:.3f} "
+                "accHi={:.3f} tp={} tn={} fp={} fn={} upRateTest={:.3f}".format(
+                    symbol,
+                    train_size,
+                    test_rows,
+                    acc_all,
+                    up_rec,
+                    down_rec,
+                    coverage,
+                    acc_highconf if not np.isnan(acc_highconf) else float("nan"),
+                    tp,
+                    tn,
+                    fp,
+                    fn,
+                    up_rate_test,
+                )
+            )
+            results.append(
+                {
+                    "train_size": train_size,
+                    "acc_all": acc_all,
+                    "coverage": coverage,
+                    "acc_hi": acc_highconf,
+                }
+            )
+        if not results:
+            continue
+        valid_hi = [item for item in results if not np.isnan(item["acc_hi"])]
+        if valid_hi:
+            def _score(item: dict[str, float | int]) -> tuple[float, float, float]:
+                acc_hi = float(item["acc_hi"])
+                coverage = float(item["coverage"])
+                if coverage < 0.02:
+                    acc_hi -= 1.0
+                return acc_hi, coverage, float(item["acc_all"])
+            best = max(valid_hi, key=_score)
+        else:
+            best = max(results, key=lambda item: float(item["acc_all"]))
+        best_train_size = int(best["train_size"])
+        best_acc_hi = float(best["acc_hi"]) if not np.isnan(best["acc_hi"]) else float("nan")
+        best_coverage = float(best["coverage"])
+        best_acc_all = float(best["acc_all"])
+        print(
+            "BEST_EVAL symbol={} bestTrain={} bestAccHi={:.3f} bestCoverage={:.3f} bestAcc={:.3f}".format(
+                symbol,
+                best_train_size,
+                best_acc_hi if not np.isnan(best_acc_hi) else float("nan"),
+                best_coverage,
+                best_acc_all,
+            )
+        )
+        if args.eval_only:
+            continue
+        train_start = len(frame_tail) - test_rows - best_train_size
+        x_train = x_tail.iloc[train_start:test_start]
+        y_train = y_tail.iloc[train_start:test_start]
+        train_frame = frame_tail.iloc[train_start:test_start]
+        up_mask = train_frame["labelUp"] == 1
+        down_mask = train_frame["labelUp"] == 0
         mean_ret_up = None
         mean_ret_down = None
         if up_mask.any():
-            mean_ret_up = float(merged.loc[up_mask, "futureRet_1"].mean())
+            mean_ret_up = float(train_frame.loc[up_mask, "futureRet_1"].mean())
         if down_mask.any():
-            mean_ret_down = float(merged.loc[down_mask, "futureRet_1"].mean())
+            mean_ret_down = float(train_frame.loc[down_mask, "futureRet_1"].mean())
         n_up = int(up_mask.sum())
         n_down = int(down_mask.sum())
         total_labels = n_up + n_down
         up_rate = float(n_up / total_labels) if total_labels > 0 else 0.0
-        base_pipeline = build_pipeline("lbfgs")
-        print(
-            "MODEL_CONFIG symbol={} solver=lbfgs max_iter=4000 scaler=StandardScaler".format(symbol)
-        )
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", ConvergenceWarning)
-            base_pipeline.fit(x, y)
-        has_convergence_warning = any(
-            isinstance(warning.message, ConvergenceWarning) for warning in caught
-        )
-        if has_convergence_warning:
-            print("WARN_CONVERGENCE symbol={} solver=lbfgs fallback_solver=saga".format(symbol))
-            base_pipeline = build_pipeline("saga")
-            print(
-                "MODEL_CONFIG symbol={} solver=saga max_iter=4000 scaler=StandardScaler".format(symbol)
-            )
-            base_pipeline.fit(x, y)
-        calibrated = None
-        if args.calibrate:
-            tscv = TimeSeriesSplit(n_splits=3)
-            calibrated = CalibratedClassifierCV(estimator=base_pipeline, method="sigmoid", cv=tscv)
-            calibrated.fit(x, y)
+        base_pipeline, calibrated, classes = fit_model(x_train, y_train, args.calibrate, symbol)
         model_for_stats = calibrated if calibrated is not None else base_pipeline
-        classifier = base_pipeline.named_steps["classifier"]
-        classes = list(getattr(classifier, "classes_", []))
         if not classes:
             raise RuntimeError(f"No classes_ found for symbol {symbol}")
         if 1 not in classes:
             raise RuntimeError(f"UP class (1) missing in classes for symbol {symbol}: {classes}")
         up_class_index = classes.index(1)
-        p_up = model_for_stats.predict_proba(x)[:, up_class_index]
-        p_up_min = float(np.min(p_up))
-        p_up_max = float(np.max(p_up))
-        p_up_mean = float(np.mean(p_up))
-        print(f"PUP_STATS symbol={symbol} min={p_up_min:.6f} max={p_up_max:.6f} mean={p_up_mean:.6f}")
-        if p_up_max < 0.05 or p_up_mean < 0.01:
+        pUp = model_for_stats.predict_proba(x_train)[:, up_class_index]
+        pUp_min = float(np.min(pUp))
+        pUp_max = float(np.max(pUp))
+        pUp_mean = float(np.mean(pUp))
+        print(f"PUP_STATS symbol={symbol} min={pUp_min:.6f} max={pUp_max:.6f} mean={pUp_mean:.6f}")
+        if pUp_max < 0.05 or pUp_mean < 0.01:
             print(
                 "WARN_PUP_DEGENERATE symbol={} max={:.6f} mean={:.6f} "
-                "reason=class_index_or_features_or_nan_issue".format(symbol, p_up_max, p_up_mean)
+                "reason=class_index_or_features_or_nan_issue".format(symbol, pUp_max, pUp_mean)
             )
         model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
         model_dir = args.out_dir / symbol / model_version
         export_model = calibrated if calibrated is not None else base_pipeline
         try:
-            input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
+            input_names, output_names = export_onnx(
+                export_model, x_train.shape[1], model_dir / "model.onnx"
+            )
             print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
         except Exception as exc:
             print(f"ONNX_EXPORT_FAILED symbol={symbol} calibrated failed ({exc}); fallback: export non-calibrated.")
             export_model = base_pipeline
-            input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
+            input_names, output_names = export_onnx(
+                export_model, x_train.shape[1], model_dir / "model.onnx"
+            )
             print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
         prob_output_name = "probabilities" if "probabilities" in output_names else None
         if export_model is base_pipeline:
@@ -365,18 +562,18 @@ def main() -> None:
 
                 sess = ort.InferenceSession(str(model_dir / "model.onnx"), providers=["CPUExecutionProvider"])
                 input_name = sess.get_inputs()[0].name
-                x_check = x.iloc[:256].to_numpy(dtype=np.float32)
+                x_check = x_train.iloc[:256].to_numpy(dtype=np.float32)
                 outputs = sess.run(None, {input_name: x_check})
                 if outputs:
                     onnx_probs = np.array(outputs[0])
                     if onnx_probs.ndim >= 2 and onnx_probs.shape[1] > up_class_index:
-                        p_up_onnx = onnx_probs[:, up_class_index]
-                        mean_onnx = float(np.mean(p_up_onnx))
+                        pUp_onnx = onnx_probs[:, up_class_index]
+                        mean_onnx = float(np.mean(pUp_onnx))
                         print(
-                            f"ONNX_CHECK symbol={symbol} meanSklearn={p_up_mean:.6f} meanOnnx={mean_onnx:.6f}"
+                            f"ONNX_CHECK symbol={symbol} meanSklearn={pUp_mean:.6f} meanOnnx={mean_onnx:.6f}"
                         )
-                        if abs(p_up_mean - mean_onnx) > 1e-2:
-                            print(f"WARN_ONNX_MISMATCH symbol={symbol} diff={abs(p_up_mean - mean_onnx):.6f}")
+                        if abs(pUp_mean - mean_onnx) > 1e-2:
+                            print(f"WARN_ONNX_MISMATCH symbol={symbol} diff={abs(pUp_mean - mean_onnx):.6f}")
                     else:
                         print(f"WARN_ONNX_MISMATCH symbol={symbol} reason=unexpected_output_shape")
                 else:
@@ -389,7 +586,7 @@ def main() -> None:
             model_version,
             symbol,
             train_days,
-            len(x),
+            len(x_train),
             mean_ret_up,
             mean_ret_down,
             n_up,
@@ -400,13 +597,18 @@ def main() -> None:
             feature_order,
             output_names,
             prob_output_name,
+            best_train_size,
+            best_acc_hi,
+            best_coverage,
+            best_acc_all,
+            test_rows,
         )
         write_current(model_dir, args.out_dir, symbol)
         wrote_path = args.out_dir / symbol / "current"
         print(
             "TRAIN_SYMBOL symbol={} rows={} upRate={:.6f} calibrated={} wrote={}".format(
                 symbol,
-                len(x),
+                len(x_train),
                 up_rate,
                 args.calibrate,
                 wrote_path,
