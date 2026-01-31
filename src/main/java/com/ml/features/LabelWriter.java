@@ -1,0 +1,36 @@
+package com.ml.features;
+
+import com.ml.raw.GzipJsonlAppender;
+import java.nio.file.Path;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+@Component
+public class LabelWriter {
+
+    private static final Logger log = LoggerFactory.getLogger(LabelWriter.class);
+
+    private final GzipJsonlAppender appender;
+
+    public LabelWriter(GzipJsonlAppender appender) {
+        this.appender = appender;
+    }
+
+    public Path append(LabelRecord record) {
+        if (record == null) {
+            return null;
+        }
+        try {
+            Path file = appender.appendLabel(record);
+            log.info("LABEL_WRITE symbol={} closeTimeMs={} file={} labelUp={}",
+                    record.getSymbol(),
+                    record.getCloseTimeMs(),
+                    file,
+                    record.getLabelUp());
+            return file;
+        } catch (Exception ex) {
+            throw new RuntimeException(ex);
+        }
+    }
+}

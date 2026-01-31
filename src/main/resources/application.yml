@@ -1,10 +1,12 @@
 spring.application.name: ml
 
-raw:
+ml:
   symbols:
     - MANAUSDT
     - XRPUSDT
   tf: 5m
   data-dir: data
   partition-zone: UTC
+  warmup-bars: 500
+  features-version: ftr_5m_v1
   eps: 1e-12
