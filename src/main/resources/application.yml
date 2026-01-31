@@ -8,7 +8,7 @@ ml:
   data-dir: data
   partition-zone: Europe/Istanbul
   warmup-bars: 500
-  features-version: v1
+  features-version: ftr_5m_v1
   baseline-dir: data_baseline
   train-dir: data/train
   expected-gap-ms: 300000

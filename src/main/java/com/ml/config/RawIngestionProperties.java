@@ -30,7 +30,7 @@ public class RawIngestionProperties {
     private Integer warmupBars = 500;
 
     @NotBlank
-    private String featuresVersion = "v1";
+    private String featuresVersion = "ftr_5m_v1";
 
     @NotNull
     private Path baselineDir = Path.of("data_baseline");

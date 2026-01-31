@@ -2,21 +2,11 @@ package com.ml.features;
 
 import com.ml.config.RawIngestionProperties;
 import com.ml.features.RollingFeatureState.Bar;
-import java.util.ArrayList;
 import java.util.List;
 import org.springframework.stereotype.Component;
 
 @Component
 public class FeatureCalculator {
-
-    private static final int BB_PERIOD = 20;
-    private static final double BB_STD_DEV = 2.0d;
-    private static final int EMA_FAST = 12;
-    private static final int EMA_SLOW = 26;
-    private static final int EMA_SIGNAL = 9;
-    private static final int RSI_PERIOD = 9;
-    private static final int ADX_PERIOD = 14;
-    private static final int VOL_RATIO_PERIOD = 12;
 
     private final RawIngestionProperties properties;
 
@@ -32,43 +22,67 @@ public class FeatureCalculator {
         List<Bar> bars = state.getBars();
         FeatureRecord record = new FeatureRecord();
         record.setSymbol(state.getSymbol());
-        record.setOpenTimeMs(current.getOpenTimeMs());
         record.setCloseTimeMs(current.getCloseTimeMs());
-        record.setEventTimeMs(current.getEventTimeMs() == 0L ? null : current.getEventTimeMs());
+        record.setClosePrice(Double.toString(current.getClose()));
         record.setFeaturesVersion(properties.getFeaturesVersion());
 
-        boolean windowReady = true;
-        List<Double> x = new ArrayList<>();
-
         Double ret1 = computeReturn(bars, 1);
+        Double logRet1 = computeLogReturn(bars, 1);
         Double ret3 = computeReturn(bars, 3);
-        Double ret6 = computeReturn(bars, 6);
-        Double bbPercent = computeBbPercentB(bars);
-        Double bbWidth = computeBbWidth(bars);
-        Double ema20Dist = computeEmaDist(bars, 20);
-        Double rsi9 = computeRsi(bars, RSI_PERIOD);
-        Double adx14 = computeAdx(bars, ADX_PERIOD);
-        Double macdDelta = computeMacdDelta(bars);
-        Double volRatio = computeVolumeRatio(bars, VOL_RATIO_PERIOD);
+        Double ret12 = computeReturn(bars, 12);
+        Double realizedVol6 = computeRealizedVol(bars, 6);
+        Double realizedVol24 = computeRealizedVol(bars, 24);
 
-        windowReady &= ret1 != null && ret3 != null && ret6 != null;
-        windowReady &= bbPercent != null && bbWidth != null;
-        windowReady &= ema20Dist != null && rsi9 != null && adx14 != null;
-        windowReady &= macdDelta != null && volRatio != null;
+        double eps = properties.getEps().doubleValue();
+        double range = Math.max(current.getHigh() - current.getLow(), 0.0d);
+        Double rangePct = range / safeDenom(current.getClose(), eps);
+        Double bodyPct = Math.abs(current.getClose() - current.getOpen()) / safeDenom(current.getClose(), eps);
+        Double upperWickPct = Math.max(0.0d, current.getHigh() - Math.max(current.getOpen(), current.getClose()))
+                / safeDenom(current.getClose(), eps);
+        Double lowerWickPct = Math.max(0.0d, Math.min(current.getOpen(), current.getClose()) - current.getLow())
+                / safeDenom(current.getClose(), eps);
+        Double closePos = (current.getClose() - current.getLow()) / Math.max(range, eps);
 
-        x.add(orZero(ret1));
-        x.add(orZero(ret3));
-        x.add(orZero(ret6));
-        x.add(orZero(bbPercent));
-        x.add(orZero(bbWidth));
-        x.add(orZero(ema20Dist));
-        x.add(orZero(rsi9));
-        x.add(orZero(adx14));
-        x.add(orZero(macdDelta));
-        x.add(orZero(volRatio));
+        Double volRatio12 = computeRatio(bars, 12, Bar::getVolume);
+        Double tradeRatio12 = computeRatio(bars, 12, bar -> (double) bar.getTradeCount());
+        Double buySellRatio = current.getBuySellRatio();
+        Double deltaVolNorm = current.getDeltaBaseVol() / Math.max(current.getVolume(), eps);
 
+        Double rsi14 = computeRsi(bars, 14);
+        Double atr14 = computeAtr(bars, 14);
+        Double ema20 = computeEma(bars, 20);
+        Double ema200 = computeEma(bars, 200);
+        Double ema20Dist = ema20 == null ? null : (current.getClose() - ema20) / ema20;
+        Double ema200Dist = ema200 == null ? null : (current.getClose() - ema200) / ema200;
+
+        record.setRet_1(ret1);
+        record.setLogRet_1(logRet1);
+        record.setRet_3(ret3);
+        record.setRet_12(ret12);
+        record.setRealizedVol_6(realizedVol6);
+        record.setRealizedVol_24(realizedVol24);
+        record.setRangePct(rangePct);
+        record.setBodyPct(bodyPct);
+        record.setUpperWickPct(upperWickPct);
+        record.setLowerWickPct(lowerWickPct);
+        record.setClosePos(closePos);
+        record.setVolRatio_12(volRatio12);
+        record.setTradeRatio_12(tradeRatio12);
+        record.setBuySellRatio(buySellRatio);
+        record.setDeltaVolNorm(deltaVolNorm);
+        record.setRsi14(rsi14);
+        record.setAtr14(atr14);
+        record.setEma20DistPct(ema20Dist);
+        record.setEma200DistPct(ema200Dist);
+
+        boolean windowReady = bars.size() >= 200
+                && ret12 != null
+                && realizedVol24 != null
+                && volRatio12 != null
+                && tradeRatio12 != null
+                && rsi14 != null
+                && atr14 != null;
         record.setWindowReady(windowReady);
-        record.setX(x);
         return record;
     }
 
@@ -85,46 +99,62 @@ public class FeatureCalculator {
         return current / past - 1.0d;
     }
 
-    private Double computeBbPercentB(List<Bar> bars) {
+    private Double computeLogReturn(List<Bar> bars, int lag) {
         int size = bars.size();
-        if (size < BB_PERIOD) {
+        if (size < lag + 1) {
             return null;
         }
-        Stats stats = computeStats(bars, BB_PERIOD);
-        if (stats == null || stats.stdDev == 0.0d) {
+        double current = bars.get(size - 1).getClose();
+        double past = bars.get(size - 1 - lag).getClose();
+        if (past == 0.0d || current == 0.0d) {
             return null;
         }
-        double close = bars.get(size - 1).getClose();
-        double lower = stats.mean - BB_STD_DEV * stats.stdDev;
-        double upper = stats.mean + BB_STD_DEV * stats.stdDev;
-        double denom = upper - lower;
-        if (denom == 0.0d) {
-            return null;
-        }
-        return (close - lower) / denom;
+        return Math.log(current / past);
     }
 
-    private Double computeBbWidth(List<Bar> bars) {
+    private Double computeRealizedVol(List<Bar> bars, int window) {
         int size = bars.size();
-        if (size < BB_PERIOD) {
+        if (size < window + 1) {
             return null;
         }
-        Stats stats = computeStats(bars, BB_PERIOD);
-        if (stats == null || stats.mean == 0.0d) {
-            return null;
+        double[] logRets = new double[window];
+        for (int i = 0; i < window; i++) {
+            double close = bars.get(size - window + i).getClose();
+            double prev = bars.get(size - window + i - 1).getClose();
+            if (prev == 0.0d) {
+                return null;
+            }
+            logRets[i] = Math.log(close / prev);
         }
-        double upper = stats.mean + BB_STD_DEV * stats.stdDev;
-        double lower = stats.mean - BB_STD_DEV * stats.stdDev;
-        return (upper - lower) / stats.mean;
+        double mean = 0.0d;
+        for (double value : logRets) {
+            mean += value;
+        }
+        mean /= window;
+        double variance = 0.0d;
+        for (double value : logRets) {
+            double diff = value - mean;
+            variance += diff * diff;
+        }
+        variance /= window;
+        return Math.sqrt(variance);
     }
 
-    private Double computeEmaDist(List<Bar> bars, int period) {
-        Double ema = computeEma(bars, period);
-        if (ema == null || ema == 0.0d) {
+    private Double computeRatio(List<Bar> bars, int window, ToDouble extractor) {
+        int size = bars.size();
+        if (size < window) {
             return null;
         }
-        double close = bars.get(bars.size() - 1).getClose();
-        return (close - ema) / ema;
+        double sum = 0.0d;
+        for (int i = size - window; i < size; i++) {
+            sum += extractor.value(bars.get(i));
+        }
+        double sma = sum / window;
+        if (sma == 0.0d) {
+            return null;
+        }
+        double current = extractor.value(bars.get(size - 1));
+        return current / sma;
     }
 
     private Double computeEma(List<Bar> bars, int period) {
@@ -176,140 +206,21 @@ public class FeatureCalculator {
         return 100.0d - (100.0d / (1.0d + rs));
     }
 
-    private Double computeAdx(List<Bar> bars, int period) {
+    private Double computeAtr(List<Bar> bars, int period) {
         int size = bars.size();
         if (size < period + 1) {
             return null;
         }
-        double[] tr = new double[size - 1];
-        double[] plusDm = new double[size - 1];
-        double[] minusDm = new double[size - 1];
-        for (int i = 1; i < size; i++) {
-            Bar current = bars.get(i);
-            Bar prev = bars.get(i - 1);
-            double upMove = current.getHigh() - prev.getHigh();
-            double downMove = prev.getLow() - current.getLow();
-            plusDm[i - 1] = (upMove > downMove && upMove > 0) ? upMove : 0.0d;
-            minusDm[i - 1] = (downMove > upMove && downMove > 0) ? downMove : 0.0d;
-            tr[i - 1] = trueRange(current, prev.getClose());
+        double trSum = 0.0d;
+        for (int i = 1; i <= period; i++) {
+            trSum += trueRange(bars.get(i), bars.get(i - 1).getClose());
         }
-        double atr = 0.0d;
-        double plusDmSum = 0.0d;
-        double minusDmSum = 0.0d;
-        for (int i = 0; i < period; i++) {
-            atr += tr[i];
-            plusDmSum += plusDm[i];
-            minusDmSum += minusDm[i];
+        double atr = trSum / period;
+        for (int i = period + 1; i < size; i++) {
+            double tr = trueRange(bars.get(i), bars.get(i - 1).getClose());
+            atr = (atr * (period - 1) + tr) / period;
         }
-        atr /= period;
-        double plusDi = atr == 0.0d ? 0.0d : 100.0d * (plusDmSum / period) / atr;
-        double minusDi = atr == 0.0d ? 0.0d : 100.0d * (minusDmSum / period) / atr;
-        double dx = (plusDi + minusDi) == 0.0d ? 0.0d : 100.0d * Math.abs(plusDi - minusDi) / (plusDi + minusDi);
-        double adx = dx;
-        for (int i = period; i < tr.length; i++) {
-            atr = (atr * (period - 1) + tr[i]) / period;
-            plusDmSum = (plusDmSum * (period - 1) + plusDm[i]) / period;
-            minusDmSum = (minusDmSum * (period - 1) + minusDm[i]) / period;
-            plusDi = atr == 0.0d ? 0.0d : 100.0d * plusDmSum / atr;
-            minusDi = atr == 0.0d ? 0.0d : 100.0d * minusDmSum / atr;
-            dx = (plusDi + minusDi) == 0.0d ? 0.0d : 100.0d * Math.abs(plusDi - minusDi) / (plusDi + minusDi);
-            adx = (adx * (period - 1) + dx) / period;
-        }
-        return adx;
-    }
-
-    private Double computeMacdDelta(List<Bar> bars) {
-        int size = bars.size();
-        if (size < EMA_SLOW + EMA_SIGNAL) {
-            return null;
-        }
-        List<Double> fastSeries = computeEmaSeries(bars, EMA_FAST);
-        List<Double> slowSeries = computeEmaSeries(bars, EMA_SLOW);
-        if (fastSeries.isEmpty() || slowSeries.isEmpty()) {
-            return null;
-        }
-        int offset = EMA_SLOW - EMA_FAST;
-        List<Double> macdSeries = new ArrayList<>();
-        for (int i = 0; i < slowSeries.size(); i++) {
-            macdSeries.add(fastSeries.get(i + offset) - slowSeries.get(i));
-        }
-        if (macdSeries.size() < EMA_SIGNAL) {
-            return null;
-        }
-        double signal = computeEmaFromSeries(macdSeries, EMA_SIGNAL);
-        double macd = macdSeries.get(macdSeries.size() - 1);
-        return macd - signal;
-    }
-
-    private double computeEmaFromSeries(List<Double> series, int period) {
-        double sum = 0.0d;
-        for (int i = 0; i < period; i++) {
-            sum += series.get(i);
-        }
-        double ema = sum / period;
-        double k = 2.0d / (period + 1.0d);
-        for (int i = period; i < series.size(); i++) {
-            double value = series.get(i);
-            ema = (value - ema) * k + ema;
-        }
-        return ema;
-    }
-
-    private List<Double> computeEmaSeries(List<Bar> bars, int period) {
-        int size = bars.size();
-        if (size < period) {
-            return List.of();
-        }
-        double sum = 0.0d;
-        for (int i = 0; i < period; i++) {
-            sum += bars.get(i).getClose();
-        }
-        double ema = sum / period;
-        double k = 2.0d / (period + 1.0d);
-        List<Double> series = new ArrayList<>();
-        series.add(ema);
-        for (int i = period; i < size; i++) {
-            double close = bars.get(i).getClose();
-            ema = (close - ema) * k + ema;
-            series.add(ema);
-        }
-        return series;
-    }
-
-    private Double computeVolumeRatio(List<Bar> bars, int period) {
-        int size = bars.size();
-        if (size < period) {
-            return null;
-        }
-        double sum = 0.0d;
-        for (int i = size - period; i < size; i++) {
-            sum += bars.get(i).getVolume();
-        }
-        double sma = sum / period;
-        if (sma == 0.0d) {
-            return null;
-        }
-        double current = bars.get(size - 1).getVolume();
-        return current / sma;
-    }
-
-    private Stats computeStats(List<Bar> bars, int period) {
-        int size = bars.size();
-        if (size < period) {
-            return null;
-        }
-        double sum = 0.0d;
-        for (int i = size - period; i < size; i++) {
-            sum += bars.get(i).getClose();
-        }
-        double mean = sum / period;
-        double variance = 0.0d;
-        for (int i = size - period; i < size; i++) {
-            double diff = bars.get(i).getClose() - mean;
-            variance += diff * diff;
-        }
-        variance /= period;
-        return new Stats(mean, Math.sqrt(variance));
+        return atr;
     }
 
     private double trueRange(Bar bar, double prevClose) {
@@ -319,17 +230,12 @@ public class FeatureCalculator {
         return Math.max(highLow, Math.max(highClose, lowClose));
     }
 
-    private double orZero(Double value) {
-        return value == null ? 0.0d : value;
+    private double safeDenom(double value, double eps) {
+        return Math.abs(value) < eps ? eps : value;
     }
 
-    private static final class Stats {
-        private final double mean;
-        private final double stdDev;
-
-        private Stats(double mean, double stdDev) {
-            this.mean = mean;
-            this.stdDev = stdDev;
-        }
+    @FunctionalInterface
+    private interface ToDouble {
+        double value(Bar bar);
     }
 }
