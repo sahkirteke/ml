@@ -4,6 +4,7 @@ import argparse
 import itertools
 import json
 import math
+import random
 import re
 import time
 import warnings
@@ -14,9 +15,13 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from skl2onnx import convert_sklearn
@@ -51,7 +56,7 @@ TP_PCT = 0.004
 SL_PCT = 0.002
 GAP_MS = 300000
 CONF_THRESHOLD = 0.55
-TRAIN_LIMIT = 200000
+TRAIN_LIMIT = 400000
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,9 +70,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-rows", default=100000, type=int, help="Rows to hold out for evaluation")
     parser.add_argument("--val-rows", default=50000, type=int, help="Rows to hold out for validation")
     parser.add_argument("--auto-tune", action="store_true", help="Enable hyperparameter tuning")
-    parser.add_argument("--max-trials", default=40, type=int, help="Maximum tuning trials")
+    parser.add_argument("--max-trials", default=80, type=int, help="Maximum tuning trials")
     parser.add_argument("--target-acc", default=0.65, type=float, help="Target accHi to stop tuning")
-    parser.add_argument("--min-coverage", default=0.0005, type=float, help="Minimum coverage to stop tuning")
+    parser.add_argument("--min-coverage", default=0.0002, type=float, help="Minimum coverage to stop tuning")
     parser.add_argument("--conf-threshold", default=CONF_THRESHOLD, type=float, help="Confidence threshold")
     parser.add_argument("--eval-only", action="store_true", help="Only run evaluation (skip export)")
     parser.add_argument("--fast-tail", action="store_true", help="Read only the latest rows needed")
@@ -300,7 +305,7 @@ def build_training_frame(
     return x, y, merged, list(x.columns)
 
 
-def build_pipeline(
+def build_lr_pipeline(
     solver: str,
     *,
     c_value: float = 1.0,
@@ -333,6 +338,58 @@ def build_pipeline(
     return Pipeline(base_steps + [("classifier", lr)])
 
 
+def build_rf_pipeline(
+    *,
+    n_estimators: int,
+    max_depth: int,
+    min_samples_leaf: int,
+    class_weight: str | None,
+) -> Pipeline:
+    rf = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+        class_weight=class_weight,
+        n_jobs=-1,
+        random_state=42,
+    )
+    return Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("classifier", rf),
+        ]
+    )
+
+
+def build_model(model_name: str, params: dict[str, object]):
+    if model_name == "LR":
+        return build_lr_pipeline(
+            params["solver"],
+            c_value=float(params["C"]),
+            class_weight=params["class_weight"],
+            max_iter=int(params["max_iter"]),
+            tol=float(params["tol"]),
+        )
+    if model_name == "RF":
+        return build_rf_pipeline(
+            n_estimators=int(params["n_estimators"]),
+            max_depth=int(params["max_depth"]),
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            class_weight=params["class_weight"],
+        )
+    return HistGradientBoostingClassifier(
+        max_depth=int(params["max_depth"]),
+        max_iter=int(params["max_iter"]),
+        learning_rate=float(params["learning_rate"]),
+        min_samples_leaf=int(params["min_samples_leaf"]),
+        l2_regularization=float(params["l2_regularization"]),
+        early_stopping=True,
+        validation_fraction=0.1,
+        n_iter_no_change=10,
+        random_state=42,
+    )
+
+
 def export_onnx(model, feature_count: int, output_path: Path) -> tuple[list[str], list[str]]:
     initial_type = [("input", FloatTensorType([None, feature_count]))]
     onnx_model = convert_sklearn(
@@ -359,11 +416,12 @@ def write_meta(
     feature_order: list[str],
     onnx_outputs: list[str],
     prob_output_name: str | None,
-    last_eval_acc_hi: float,
-    last_eval_coverage: float,
-    last_eval_acc_all: float,
+    val_acc_hi: float,
+    val_coverage: float,
+    val_acc_all: float,
     best_train_rows: int,
     test_rows: int,
+    best_model: str,
     best_params: dict[str, object],
     conf_threshold: float,
     target_acc: float,
@@ -372,6 +430,7 @@ def write_meta(
     test_coverage: float,
     test_acc_all: float,
     val_rows: int,
+    export_fallback: bool,
 ) -> None:
     def _json_default(o):
         if isinstance(o, np.integer):
@@ -402,27 +461,23 @@ def write_meta(
         "maxHorizonBars": MAX_HORIZON_BARS,
         "classes": classes,
         "upClassIndex": up_class_index,
+        "bestModel": best_model,
         "bestParams": best_params,
         "confThreshold": conf_threshold,
         "targetAcc": target_acc,
         "minCoverage": min_coverage,
-        "lastEvalAccHi": last_eval_acc_hi,
-        "lastEvalCoverage": last_eval_coverage,
-        "lastEvalAccAll": last_eval_acc_all,
+        "valAccHi": val_acc_hi,
+        "valCoverage": val_coverage,
+        "valAccAll": val_acc_all,
         "bestTrainRows": best_train_rows,
         "valRows": val_rows,
         "testRows": test_rows,
         "testAccHi": test_acc_hi,
         "testCoverage": test_coverage,
         "testAccAll": test_acc_all,
+        "exportFallback": export_fallback,
         "onnxOutputs": onnx_outputs,
         "probOutputName": prob_output_name,
-        "decisionPolicy": {
-            "minConfidence": 0.55,
-            "minAbsExpectedPct": 0.002,
-            "minAbsEdge": 0.05,
-            "mode": "FILTERED",
-        },
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -528,55 +583,106 @@ def main() -> None:
             y_train_pool = y_train_pool.iloc[-TRAIN_LIMIT:]
         conf_threshold = args.conf_threshold
         best = None
+        best_exportable = None
+        candidates = []
+        trial_candidates = []
         if args.auto_tune:
-            trial_params = list(
-                itertools.product(
+            lr_trials = [
+                ("LR", params)
+                for params in itertools.product(
                     [0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
                     [None, "balanced"],
                     ["lbfgs", "saga"],
-                    [2000, 4000],
+                    [4000],
                     [1e-4, 1e-3],
                 )
+            ]
+            rf_trials = [
+                ("RF", params)
+                for params in itertools.product(
+                    [200, 400],
+                    [6, 8, 10],
+                    [20, 50],
+                    [None, "balanced"],
+                )
+            ]
+            hgb_param_grid = list(
+                itertools.product(
+                    [3, 5, 7, 9],
+                    [100, 200, 400],
+                    [0.03, 0.05, 0.1],
+                    [20, 50, 100],
+                    [0.0, 0.1, 1.0],
+                )
             )
-            max_trials = min(args.max_trials, len(trial_params))
+            random.seed(42)
+            random.shuffle(hgb_param_grid)
+            hgb_trials = [("HGB", params) for params in hgb_param_grid[:30]]
+            trial_candidates = lr_trials + hgb_trials + rf_trials
+            if args.max_trials:
+                trial_candidates = trial_candidates[: args.max_trials]
         else:
-            trial_params = [(1.0, None, "lbfgs", 4000, 1e-4)]
-            max_trials = 1
-        for trial_index in range(max_trials):
-            c_value, class_weight, solver, max_iter, tol = trial_params[trial_index]
-            params = {
-                "C": c_value,
-                "class_weight": class_weight,
-                "solver": solver,
-                "max_iter": max_iter,
-                "tol": tol,
-            }
-            base_pipeline = build_pipeline(
-                solver,
-                c_value=c_value,
-                class_weight=class_weight,
-                max_iter=max_iter,
-                tol=tol,
-            )
+            trial_candidates = [("LR", (1.0, None, "lbfgs", 4000, 1e-4))]
+        for trial_index, (model_name, params_raw) in enumerate(trial_candidates, start=1):
+            if model_name == "LR":
+                c_value, class_weight, solver, max_iter, tol = params_raw
+                params = {
+                    "C": c_value,
+                    "class_weight": class_weight,
+                    "solver": solver,
+                    "max_iter": max_iter,
+                    "tol": tol,
+                }
+                model = build_lr_pipeline(
+                    solver,
+                    c_value=c_value,
+                    class_weight=class_weight,
+                    max_iter=max_iter,
+                    tol=tol,
+                )
+            elif model_name == "RF":
+                n_estimators, max_depth, min_samples_leaf, class_weight = params_raw
+                params = {
+                    "n_estimators": n_estimators,
+                    "max_depth": max_depth,
+                    "min_samples_leaf": min_samples_leaf,
+                    "class_weight": class_weight,
+                }
+                model = build_rf_pipeline(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    min_samples_leaf=min_samples_leaf,
+                    class_weight=class_weight,
+                )
+            else:
+                max_depth, max_iter, learning_rate, min_samples_leaf, l2_regularization = params_raw
+                params = {
+                    "max_depth": max_depth,
+                    "max_iter": max_iter,
+                    "learning_rate": learning_rate,
+                    "min_samples_leaf": min_samples_leaf,
+                    "l2_regularization": l2_regularization,
+                }
+                model = build_model("HGB", params)
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ConvergenceWarning)
-                base_pipeline.fit(x_train_pool, y_train_pool)
+                model.fit(x_train_pool, y_train_pool)
             has_convergence_warning = any(
                 isinstance(warning.message, ConvergenceWarning) for warning in caught
             )
             if has_convergence_warning:
                 print(
-                    "WARN_CONVERGENCE symbol={} solver={} max_iter={} tol={}".format(
-                        symbol, solver, max_iter, tol
-                    )
+                    "WARN_CONVERGENCE symbol={} model={} params={}".format(symbol, model_name, params)
                 )
-            val_proba = base_pipeline.predict_proba(x_val)
-            classes = list(base_pipeline.named_steps["classifier"].classes_)
+            val_proba = model.predict_proba(x_val)
+            classes = list(getattr(model, "classes_", []))
+            if not classes and isinstance(model, Pipeline):
+                classes = list(model.named_steps["classifier"].classes_)
             if 1 not in classes:
                 raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
             pos_index = classes.index(1)
             p_hit = val_proba[:, pos_index]
-            val_preds = base_pipeline.predict(x_val)
+            val_preds = model.predict(x_val)
             acc_all, coverage, acc_hi, _, _ = compute_metrics(
                 y_val,
                 val_preds,
@@ -584,9 +690,10 @@ def main() -> None:
                 conf_threshold=conf_threshold,
             )
             print(
-                "TUNE symbol={} trial={} params={} accAll={:.6f} accHi={} coverage={:.6f}".format(
+                "TUNE symbol={} trial={} model={} params={} accAll={:.6f} accHi={} coverage={:.6f}".format(
                     symbol,
-                    trial_index + 1,
+                    trial_index,
+                    model_name,
                     params,
                     acc_all,
                     "nan" if np.isnan(acc_hi) else f"{acc_hi:.6f}",
@@ -595,34 +702,94 @@ def main() -> None:
             )
             score_acc_hi = -1.0 if np.isnan(acc_hi) else acc_hi
             metric = (score_acc_hi, coverage, acc_all)
+            candidate = {
+                "metric": metric,
+                "params": params,
+                "model": model,
+                "acc_all": acc_all,
+                "coverage": coverage,
+                "acc_hi": acc_hi,
+                "trial_index": trial_index,
+                "model_name": model_name,
+            }
+            candidates.append(candidate)
             if best is None or metric > best["metric"]:
-                best = {
-                    "metric": metric,
-                    "params": params,
-                    "model": base_pipeline,
-                    "acc_all": acc_all,
-                    "coverage": coverage,
-                    "acc_hi": acc_hi,
-                    "trial_index": trial_index + 1,
-                }
+                best = candidate
+            if model_name in {"LR", "RF"} and (best_exportable is None or metric > best_exportable["metric"]):
+                best_exportable = candidate
             if score_acc_hi >= args.target_acc and coverage >= args.min_coverage:
                 break
         if best is None:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} min={args.min_rows_per_symbol}")
             continue
+        if (best["metric"][0] < args.target_acc or best["coverage"] < args.min_coverage) and args.auto_tune:
+            top_models = sorted(candidates, key=lambda item: item["metric"], reverse=True)[:3]
+            for candidate in top_models:
+                estimator = build_model(candidate["model_name"], candidate["params"])
+                estimator = clone(estimator)
+                calibrator = CalibratedClassifierCV(
+                    estimator=estimator, method="sigmoid", cv=TimeSeriesSplit(n_splits=3)
+                )
+                calibrator.fit(x_train_pool, y_train_pool)
+                calib_proba = calibrator.predict_proba(x_val)
+                classes = list(calibrator.classes_)
+                if 1 not in classes:
+                    raise RuntimeError(f"Class 1 missing from calibrated classes for symbol {symbol}: {classes}")
+                pos_index = classes.index(1)
+                p_hit = calib_proba[:, pos_index]
+                calib_preds = calibrator.predict(x_val)
+                acc_all, coverage, acc_hi, _, _ = compute_metrics(
+                    y_val,
+                    calib_preds,
+                    p_hit,
+                    conf_threshold=conf_threshold,
+                )
+                if (
+                    (np.isnan(candidate["acc_hi"]) or np.isnan(acc_hi) or acc_hi >= candidate["acc_hi"])
+                    and coverage >= candidate["coverage"]
+                ):
+                    score_acc_hi = -1.0 if np.isnan(acc_hi) else acc_hi
+                    metric = (score_acc_hi, coverage, acc_all)
+                    tuned = {
+                        "metric": metric,
+                        "params": candidate["params"],
+                        "model": calibrator,
+                        "acc_all": acc_all,
+                        "coverage": coverage,
+                        "acc_hi": acc_hi,
+                        "trial_index": candidate["trial_index"],
+                        "model_name": f"{candidate['model_name']}_CAL",
+                    }
+                    print(
+                        "TUNE symbol={} trial={} model={} params={} accAll={:.6f} accHi={} coverage={:.6f}".format(
+                            symbol,
+                            candidate["trial_index"],
+                            tuned["model_name"],
+                            tuned["params"],
+                            acc_all,
+                            "nan" if np.isnan(acc_hi) else f"{acc_hi:.6f}",
+                            coverage,
+                        )
+                    )
+                    if metric > best["metric"]:
+                        best = tuned
         best_params = best["params"]
-        final_model = build_pipeline(
-            best_params["solver"],
-            c_value=best_params["C"],
-            class_weight=best_params["class_weight"],
-            max_iter=best_params["max_iter"],
-            tol=best_params["tol"],
-        )
+        best_model_name = best["model_name"]
         train_val_x = pd.concat([x_train_pool, x_val], axis=0)
         train_val_y = pd.concat([y_train_pool, y_val], axis=0)
+        if best_model_name.endswith("_CAL"):
+            base_name = best_model_name.replace("_CAL", "")
+            base_estimator = build_model(base_name, best_params)
+            final_model = CalibratedClassifierCV(
+                estimator=base_estimator, method="sigmoid", cv=TimeSeriesSplit(n_splits=3)
+            )
+        else:
+            final_model = build_model(best_model_name, best_params)
         final_model.fit(train_val_x, train_val_y)
         test_proba = final_model.predict_proba(x_test)
-        classes = list(final_model.named_steps["classifier"].classes_)
+        classes = list(getattr(final_model, "classes_", []))
+        if not classes and isinstance(final_model, Pipeline):
+            classes = list(final_model.named_steps["classifier"].classes_)
         if 1 not in classes:
             raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
         up_class_index = classes.index(1)
@@ -635,11 +802,10 @@ def main() -> None:
             conf_threshold=conf_threshold,
         )
         print(
-            "FINAL symbol={} bestTrial={} bestParams={} testAccAll={:.6f} testAccHi={} testCoverage={:.6f}".format(
+            "FINAL symbol={} bestModel={} bestParams={} testAccHi={} testCoverage={:.6f}".format(
                 symbol,
-                best["trial_index"],
+                best_model_name,
                 best_params,
-                test_acc_all,
                 "nan" if np.isnan(test_acc_hi) else f"{test_acc_hi:.6f}",
                 test_coverage,
             )
@@ -647,6 +813,7 @@ def main() -> None:
         model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
         model_dir = args.out_dir / symbol / model_version
         export_model = final_model
+        export_fallback = False
         if args.eval_only:
             print(
                 "EVAL_ONLY symbol={} train_rows={} val_rows={} test_rows={}".format(
@@ -659,7 +826,12 @@ def main() -> None:
             print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
         except Exception as exc:
             print(f"ONNX_EXPORT_FAILED symbol={symbol} error=({exc}); fallback: export base model.")
-            export_model = final_model
+            if best_model_name.startswith("HGB") and best_exportable is not None:
+                export_model = build_model(best_exportable["model_name"], best_exportable["params"])
+                export_model.fit(train_val_x, train_val_y)
+                export_fallback = True
+            else:
+                export_model = final_model
             input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
             print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
         prob_output_name = "probabilities" if "probabilities" in output_names else None
@@ -700,6 +872,7 @@ def main() -> None:
             float(best["acc_all"]),
             len(train_val_x),
             test_rows,
+            best_model_name,
             best_params,
             conf_threshold,
             args.target_acc,
@@ -708,6 +881,7 @@ def main() -> None:
             float(test_coverage),
             float(test_acc_all),
             val_rows,
+            export_fallback,
         )
         write_current(model_dir, args.out_dir, symbol)
         wrote_path = args.out_dir / symbol / "current"
