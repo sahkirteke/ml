@@ -15,6 +15,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import ai.onnxruntime.NodeInfo;
 import ai.onnxruntime.OnnxTensor;
+import ai.onnxruntime.OnnxValue;
 import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtSession;
 import ai.onnxruntime.TensorInfo;
@@ -187,7 +188,11 @@ public class OnnxModelLoader {
     private float[] extractProbabilities(OrtSession.Result result, String outputName, Integer upIndex) {
         int index = upIndex == null ? 1 : upIndex;
         try {
-            Object value = result.get(outputName).getValue();
+            OnnxValue onnxValue = result.get(outputName).orElse(null);
+            if (onnxValue == null) {
+                return new float[0];
+            }
+            Object value = onnxValue.getValue();
             if (value instanceof float[][] matrix && matrix.length > 0) {
                 float[] output = new float[matrix.length];
                 for (int i = 0; i < matrix.length; i++) {

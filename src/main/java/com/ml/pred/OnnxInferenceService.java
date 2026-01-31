@@ -84,7 +84,7 @@ public class OnnxInferenceService {
     private double extractProbability(OrtSession.Result result, String outputName, Integer upClassIndex)
             throws OrtException {
         int index = upClassIndex == null ? 1 : upClassIndex;
-        OnnxValue value = result.get(outputName);
+        OnnxValue value = result.get(outputName).orElse(null);
         if (value instanceof OnnxTensor tensor) {
             Object raw = tensor.getValue();
             if (raw instanceof float[][] matrix && matrix.length > 0) {
