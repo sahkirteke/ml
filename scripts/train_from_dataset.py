@@ -8,9 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import TimeSeriesSplit
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 
@@ -47,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude-today", action="store_true", help="Exclude today's partition (Europe/Istanbul)")
     parser.add_argument("--symbols", default=None, help="Comma-separated symbols to include")
     parser.add_argument("--min-rows-per-symbol", default=20000, type=int, help="Minimum rows required to train")
-    parser.add_argument("--logreg-c", default=0.3, type=float, help="LogisticRegression C value")
+    parser.add_argument("--calibrate", action="store_true", help="Enable probability calibration")
     return parser.parse_args()
 
 
@@ -144,30 +146,38 @@ def build_training_frame(
     if missing_features:
         raise RuntimeError(f"Missing expected feature columns: {missing_features}")
     x = merged[FEATURE_ORDER].copy()
-    x = x.fillna(0.0)
-    x = x.astype(float)
+    x = x.apply(pd.to_numeric, errors="coerce")
+    x.replace([np.inf, -np.inf], np.nan, inplace=True)
+    x = x.astype(np.float32)
     y = merged["labelUp"].astype(int)
     return x, y, merged
 
 
-def train_model(x: pd.DataFrame, y: pd.Series, *, c_value: float) -> LogisticRegression:
-    model = LogisticRegression(
-        max_iter=2000,
-        n_jobs=None,
-        class_weight="balanced",
-        C=c_value,
-        solver="lbfgs",
+def train_model(x: pd.DataFrame, y: pd.Series) -> HistGradientBoostingClassifier:
+    model = HistGradientBoostingClassifier(
+        max_iter=200,
+        max_depth=8,
+        learning_rate=0.05,
+        early_stopping=False,
+        random_state=42,
     )
     model.fit(x, y)
     return model
 
 
-def export_onnx(model, feature_count: int, output_path: Path) -> None:
+def export_onnx(model, feature_count: int, output_path: Path) -> tuple[list[str], list[str]]:
     initial_type = [("input", FloatTensorType([None, feature_count]))]
-    onnx_model = convert_sklearn(model, initial_types=initial_type)
+    onnx_model = convert_sklearn(
+        model,
+        initial_types=initial_type,
+        options={id(model): {"zipmap": False}},
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("wb") as f:
         f.write(onnx_model.SerializeToString())
+    input_names = [node.name for node in onnx_model.graph.input]
+    output_names = [node.name for node in onnx_model.graph.output]
+    return input_names, output_names
 
 
 def write_meta(
@@ -181,6 +191,8 @@ def write_meta(
     n_up: int,
     n_down: int,
     up_rate: float,
+    classes: list[int],
+    up_class_index: int,
 ) -> None:
     meta = {
         "modelVersion": model_version,
@@ -197,6 +209,9 @@ def write_meta(
         "nUp": n_up,
         "nDown": n_down,
         "upRate": up_rate,
+        "classes": classes,
+        "upClass": 1,
+        "upClassIndex": up_class_index,
         "decisionPolicy": {
             "minConfidence": 0.55,
             "minAbsExpectedPct": 0.05,
@@ -256,23 +271,68 @@ def main() -> None:
         n_down = int(down_mask.sum())
         total_labels = n_up + n_down
         up_rate = float(n_up / total_labels) if total_labels > 0 else 0.0
-        model = train_model(x, y, c_value=args.logreg_c)
-        calibrated = CalibratedClassifierCV(base_estimator=model, method="sigmoid", cv=3)
-        calibrated.fit(x, y)
+        model = train_model(x, y)
+        calibrated = None
+        if args.calibrate:
+            tscv = TimeSeriesSplit(n_splits=3)
+            calibrated = CalibratedClassifierCV(estimator=model, method="sigmoid", cv=tscv)
+            calibrated.fit(x, y)
+        model_for_stats = calibrated if calibrated is not None else model
+        classes = list(getattr(model_for_stats, "classes_", []))
+        if not classes:
+            raise RuntimeError(f"No classes_ found for symbol {symbol}")
+        if 1 not in classes:
+            raise RuntimeError(f"UP class (1) missing in classes for symbol {symbol}: {classes}")
+        up_class_index = classes.index(1)
+        p_up = model_for_stats.predict_proba(x)[:, up_class_index]
+        p_up_min = float(np.min(p_up))
+        p_up_max = float(np.max(p_up))
+        p_up_mean = float(np.mean(p_up))
+        print(f"PUP_STATS symbol={symbol} min={p_up_min:.6f} max={p_up_max:.6f} mean={p_up_mean:.6f}")
+        if p_up_max < 0.05 or p_up_mean < 0.01:
+            print(
+                "WARN_PUP_DEGENERATE symbol={} max={:.6f} mean={:.6f} "
+                "reason=class_index_or_features_or_nan_issue".format(symbol, p_up_max, p_up_mean)
+            )
         model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
         model_dir = args.out_dir / symbol / model_version
-        export_model = calibrated
+        export_model = calibrated if calibrated is not None else model
         try:
-            export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
+            input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
+            print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
         except Exception as exc:
-            print(f"ONNX_EXPORT_FAILED symbol={symbol} calibrated failed ({exc}); falling back to LogisticRegression.")
+            print(f"ONNX_EXPORT_FAILED symbol={symbol} calibrated failed ({exc}); fallback: export non-calibrated.")
             export_model = model
+            input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
+            print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
+        if export_model is model:
+            onnx_checked = False
+        else:
+            onnx_checked = True
+        if onnx_checked:
             try:
-                export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
-            except Exception as logreg_exc:
-                raise RuntimeError(
-                    f"ONNX export failed for symbol {symbol}: calibrated and LogisticRegression failed: {logreg_exc}"
-                ) from logreg_exc
+                import onnxruntime as ort
+
+                sess = ort.InferenceSession(str(model_dir / "model.onnx"), providers=["CPUExecutionProvider"])
+                input_name = sess.get_inputs()[0].name
+                x_check = x.iloc[:256].to_numpy(dtype=np.float32)
+                outputs = sess.run(None, {input_name: x_check})
+                if outputs:
+                    onnx_probs = np.array(outputs[0])
+                    if onnx_probs.ndim >= 2 and onnx_probs.shape[1] > up_class_index:
+                        p_up_onnx = onnx_probs[:, up_class_index]
+                        mean_onnx = float(np.mean(p_up_onnx))
+                        print(
+                            f"ONNX_CHECK symbol={symbol} meanSklearn={p_up_mean:.6f} meanOnnx={mean_onnx:.6f}"
+                        )
+                        if abs(p_up_mean - mean_onnx) > 1e-2:
+                            print(f"WARN_ONNX_MISMATCH symbol={symbol} diff={abs(p_up_mean - mean_onnx):.6f}")
+                    else:
+                        print(f"WARN_ONNX_MISMATCH symbol={symbol} reason=unexpected_output_shape")
+                else:
+                    print(f"WARN_ONNX_MISMATCH symbol={symbol} reason=no_outputs")
+            except Exception as exc:
+                print(f"WARN_ONNX_MISMATCH symbol={symbol} error={exc}")
         train_days = len(extract_dates(feature_files))
         write_meta(
             model_dir / "model_meta.json",
@@ -285,10 +345,20 @@ def main() -> None:
             n_up,
             n_down,
             up_rate,
+            classes,
+            up_class_index,
         )
         write_current(model_dir, args.out_dir, symbol)
         wrote_path = args.out_dir / symbol / "current"
-        print(f"TRAIN_SYMBOL symbol={symbol} rows={len(x)} upRate={up_rate:.6f} wrote={wrote_path}")
+        print(
+            "TRAIN_SYMBOL symbol={} rows={} upRate={:.6f} calibrated={} wrote={}".format(
+                symbol,
+                len(x),
+                up_rate,
+                args.calibrate,
+                wrote_path,
+            )
+        )
 
 
 if __name__ == "__main__":
