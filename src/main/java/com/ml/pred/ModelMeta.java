@@ -8,6 +8,10 @@ public class ModelMeta {
     private String featuresVersion;
     private List<String> featureOrder;
     private String imputeStrategy;
+    private Double meanRetUp;
+    private Double meanRetDown;
+    private Long nUp;
+    private Long nDown;
 
     public String getModelVersion() {
         return modelVersion;
@@ -39,5 +43,37 @@ public class ModelMeta {
 
     public void setImputeStrategy(String imputeStrategy) {
         this.imputeStrategy = imputeStrategy;
+    }
+
+    public Double getMeanRetUp() {
+        return meanRetUp;
+    }
+
+    public void setMeanRetUp(Double meanRetUp) {
+        this.meanRetUp = meanRetUp;
+    }
+
+    public Double getMeanRetDown() {
+        return meanRetDown;
+    }
+
+    public void setMeanRetDown(Double meanRetDown) {
+        this.meanRetDown = meanRetDown;
+    }
+
+    public Long getNUp() {
+        return nUp;
+    }
+
+    public void setNUp(Long nUp) {
+        this.nUp = nUp;
+    }
+
+    public Long getNDown() {
+        return nDown;
+    }
+
+    public void setNDown(Long nDown) {
+        this.nDown = nDown;
     }
 }

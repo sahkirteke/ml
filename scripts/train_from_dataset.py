@@ -139,7 +139,9 @@ def load_features_labels(
     return features, labels, feature_files, label_files
 
 
-def build_training_frame(features: pd.DataFrame, labels: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, int]:
+def build_training_frame(
+    features: pd.DataFrame, labels: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     features_filtered = features[(features["windowReady"] == True) & (features["featuresVersion"] == FEATURES_VERSION)]
     labels_filtered = labels[labels["labelType"] == LABEL_TYPE]
     merged = features_filtered.merge(
@@ -157,7 +159,7 @@ def build_training_frame(features: pd.DataFrame, labels: pd.DataFrame) -> tuple[
     x = x.fillna(0.0)
     x = x.astype(float)
     y = merged["labelUp"].astype(int)
-    return x, y, len(merged)
+    return x, y, merged
 
 
 def train_model(x: pd.DataFrame, y: pd.Series) -> LogisticRegression:
@@ -174,12 +176,27 @@ def export_onnx(model: LogisticRegression, feature_count: int, output_path: Path
         f.write(onnx_model.SerializeToString())
 
 
-def write_meta(output_path: Path, model_version: str, train_days: int, train_rows: int) -> None:
+def write_meta(
+    output_path: Path,
+    model_version: str,
+    train_days: int,
+    train_rows: int,
+    mean_ret_up: float | None,
+    mean_ret_down: float | None,
+    n_up: int,
+    n_down: int,
+) -> None:
     meta = {
         "modelVersion": model_version,
+        "featuresVersion": FEATURES_VERSION,
         "featureOrder": FEATURE_ORDER,
+        "imputeStrategy": "zero",
         "rows": train_rows,
         "days": train_days,
+        "meanRetUp": mean_ret_up,
+        "meanRetDown": mean_ret_down,
+        "nUp": n_up,
+        "nDown": n_down,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -212,13 +229,33 @@ def main() -> None:
         max_date=args.max_date,
         symbols=symbols,
     )
-    x, y, joined_rows = build_training_frame(features, labels)
+    x, y, merged = build_training_frame(features, labels)
+    joined_rows = len(merged)
+    up_mask = merged["labelUp"] == 1
+    down_mask = merged["labelUp"] == 0
+    mean_ret_up = None
+    mean_ret_down = None
+    if up_mask.any():
+        mean_ret_up = float(merged.loc[up_mask, "futureRet_1"].mean())
+    if down_mask.any():
+        mean_ret_down = float(merged.loc[down_mask, "futureRet_1"].mean())
+    n_up = int(up_mask.sum())
+    n_down = int(down_mask.sum())
     model = train_model(x, y)
     model_version = args.model_version or time.strftime("%Y%m%d%H%M%S", time.gmtime())
     model_dir = args.out_dir / model_version
     export_onnx(model, x.shape[1], model_dir / "model.onnx")
     train_days = len(extract_dates(feature_files))
-    write_meta(model_dir / "model_meta.json", model_version, train_days, len(x))
+    write_meta(
+        model_dir / "model_meta.json",
+        model_version,
+        train_days,
+        len(x),
+        mean_ret_up,
+        mean_ret_down,
+        n_up,
+        n_down,
+    )
     write_current(model_dir, args.out_dir)
     total_features_rows = len(features)
     total_labels_rows = len(labels)

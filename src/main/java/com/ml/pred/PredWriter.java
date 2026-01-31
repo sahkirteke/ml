@@ -32,12 +32,14 @@ public class PredWriter {
         this.partitionResolver = partitionResolver;
     }
 
-    public Path append(PredRecord record) throws IOException {
-        String symbol = record.getSymbol().toUpperCase();
-        String date = partitionResolver.resolveDate(record.getCloseTimeMs());
+    public Path append(Object record) throws IOException {
+        String symbol = resolveSymbol(record);
+        long partitionTimeMs = resolvePartitionTimeMs(record);
+        String date = partitionResolver.resolveDate(partitionTimeMs);
         Path symbolDir = properties.getDataDir().resolve("pred").resolve(symbol);
         Files.createDirectories(symbolDir);
-        Path file = symbolDir.resolve(symbol + "-" + record.getTf() + "-" + date + ".jsonl");
+        String tf = resolveTf(record);
+        Path file = symbolDir.resolve(symbol + "-" + tf + "-" + date + ".jsonl");
         String json = objectMapper.writeValueAsString(record);
         try (BufferedWriter writer = Files.newBufferedWriter(file, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE,
@@ -45,11 +47,37 @@ public class PredWriter {
             writer.write(json);
             writer.newLine();
         }
-        log.info("PRED_WRITE symbol={} closeTimeMs={} partition={} decision={}",
-                record.getSymbol(),
-                record.getCloseTimeMs(),
-                date,
-                record.getDecision());
+        log.info("PRED_WRITE symbol={} partition={}", symbol, date);
         return file;
+    }
+
+    private String resolveSymbol(Object record) {
+        if (record instanceof PredRecord pred) {
+            return pred.getSymbol().toUpperCase();
+        }
+        if (record instanceof EvalRecord eval) {
+            return eval.getSymbol().toUpperCase();
+        }
+        return "UNKNOWN";
+    }
+
+    private String resolveTf(Object record) {
+        if (record instanceof PredRecord pred) {
+            return pred.getTf();
+        }
+        if (record instanceof EvalRecord eval) {
+            return eval.getTf();
+        }
+        return properties.getTf();
+    }
+
+    private long resolvePartitionTimeMs(Object record) {
+        if (record instanceof PredRecord pred) {
+            return pred.getCloseTimeMs();
+        }
+        if (record instanceof EvalRecord eval) {
+            return eval.getPredCloseTimeMs();
+        }
+        return System.currentTimeMillis();
     }
 }

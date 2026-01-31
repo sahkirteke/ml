@@ -11,12 +11,16 @@ import com.ml.config.RawIngestionProperties;
 import com.ml.pred.ModelMeta;
 import com.ml.pred.OnnxInferenceService;
 import com.ml.pred.OnnxModelLoader;
+import com.ml.pred.EvalRecord;
 import com.ml.pred.PredRecord;
 import com.ml.pred.PredWriter;
 import com.ml.ws.BinanceWsClient;
 import com.ml.ws.KlineEvent;
 import com.ml.ws.KlinePayload;
 import com.ml.ws.WsEnvelope;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.Locale;
 import java.util.Optional;
 import org.slf4j.Logger;
@@ -32,6 +36,8 @@ import reactor.core.publisher.Mono;
 public class RawIngestionService implements ApplicationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(RawIngestionService.class);
+    private static final ZoneId ISTANBUL_ZONE = ZoneId.of("Europe/Istanbul");
+    private static final DateTimeFormatter ISO_FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
 
     private final BinanceWsClient wsClient;
     private final RawRecordBuilder recordBuilder;
@@ -110,6 +116,7 @@ public class RawIngestionService implements ApplicationRunner {
             try {
                 appender.append(record);
                 RollingFeatureState state = stateRegistry.getOrCreate(symbol);
+                evaluatePrediction(symbol, state.getLatest(), record);
                 LabelRecord labelRecord = buildLabel(state, record);
                 if (labelRecord != null) {
                     if (symbolState.updateLabelsIfNewer(symbol, labelRecord.getCloseTimeMs())) {
@@ -171,26 +178,104 @@ public class RawIngestionService implements ApplicationRunner {
             }
             double pUp = pUpOpt.get();
             PredRecord predRecord = new PredRecord();
+            predRecord.setType("PRED");
             predRecord.setSymbol(symbol);
             predRecord.setTf(featureRecord.getTf());
             predRecord.setCloseTimeMs(featureRecord.getCloseTimeMs());
+            predRecord.setCloseTime(formatMs(featureRecord.getCloseTimeMs()));
             predRecord.setFeaturesVersion(featureRecord.getFeaturesVersion());
             predRecord.setModelVersion(meta.get().getModelVersion());
             predRecord.setPUp(pUp);
             predRecord.setDecision(pUp >= 0.5d ? "UP" : "DOWN");
             predRecord.setLoggedAtMs(System.currentTimeMillis());
-            predWriter.append(predRecord);
+            predRecord.setLoggedAt(formatMs(predRecord.getLoggedAtMs()));
             double conf = Math.max(pUp, 1.0d - pUp);
-            log.info("PRED symbol={} closeTimeMs={} pUp={} conf={} decision={} modelVersion={}",
+            predRecord.setConfidence(conf);
+            Double expectedPct = null;
+            Double meanRetUp = meta.get().getMeanRetUp();
+            Double meanRetDown = meta.get().getMeanRetDown();
+            if (meanRetUp != null && meanRetDown != null) {
+                double expectedRet = pUp * meanRetUp + (1.0d - pUp) * meanRetDown;
+                expectedPct = expectedRet * 100.0d;
+                predRecord.setExpectedPct(expectedPct);
+            }
+            predWriter.append(predRecord);
+            log.info("PRED symbol={} closeTimeMs={} pUp={} conf={} expectedPct={} decision={} modelVersion={}",
                     symbol,
                     featureRecord.getCloseTimeMs(),
                     pUp,
                     conf,
+                    expectedPct,
                     predRecord.getDecision(),
                     meta.get().getModelVersion());
             symbolState.updatePredIfNewer(symbol, featureRecord.getCloseTimeMs());
+            symbolState.setLastPredInfo(symbol, predRecord.getDecision(), pUp);
         } catch (Exception ex) {
             log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs(), ex);
+        }
+    }
+
+    private void evaluatePrediction(String symbol, RollingFeatureState.Bar previous, RawRecord current) {
+        if (previous == null) {
+            return;
+        }
+        long predCloseTimeMs = symbolState.getLastPredCloseTimeMs(symbol);
+        if (predCloseTimeMs <= 0 || predCloseTimeMs != previous.getCloseTimeMs()) {
+            return;
+        }
+        long expectedGap = properties.getExpectedGapMs() == null ? 300_000L : properties.getExpectedGapMs();
+        long gapMs = current.getCloseTimeMs() - previous.getCloseTimeMs();
+        EvalRecord evalRecord = new EvalRecord();
+        evalRecord.setType("EVAL");
+        evalRecord.setSymbol(symbol);
+        evalRecord.setTf(properties.getTf());
+        evalRecord.setPredCloseTimeMs(previous.getCloseTimeMs());
+        evalRecord.setPredCloseTime(formatMs(previous.getCloseTimeMs()));
+        evalRecord.setPredDecision(symbolState.getLastPredDecision(symbol));
+        evalRecord.setPredPUp(symbolState.getLastPredPUp(symbol));
+        evalRecord.setActualCloseTimeMs(current.getCloseTimeMs());
+        evalRecord.setActualCloseTime(formatMs(current.getCloseTimeMs()));
+        evalRecord.setEvaluatedAtMs(System.currentTimeMillis());
+        evalRecord.setEvaluatedAt(formatMs(evalRecord.getEvaluatedAtMs()));
+        if (gapMs != expectedGap) {
+            evalRecord.setResult("SKIP_GAP");
+            try {
+                predWriter.append(evalRecord);
+                log.info("EVAL symbol={} predCloseTimeMs={} result=SKIP_GAP",
+                        symbol,
+                        previous.getCloseTimeMs());
+            } catch (Exception ex) {
+                log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, current.getCloseTimeMs(), ex);
+            }
+            return;
+        }
+        double currentClose = parseDouble(current.getClosePrice());
+        double prevClose = previous.getClose();
+        if (prevClose == 0.0d || currentClose == 0.0d) {
+            return;
+        }
+        double futureRet = currentClose / prevClose - 1.0d;
+        boolean actualUp = futureRet > 0.0d;
+        String predDecision = symbolState.getLastPredDecision(symbol);
+        String result = "NOK";
+        if ("UP".equalsIgnoreCase(predDecision) && actualUp) {
+            result = "OK";
+        } else if ("DOWN".equalsIgnoreCase(predDecision) && !actualUp) {
+            result = "OK";
+        }
+        evalRecord.setFutureRet_1(futureRet);
+        evalRecord.setActualUp(actualUp);
+        evalRecord.setResult(result);
+        try {
+            predWriter.append(evalRecord);
+            log.info("EVAL symbol={} predCloseTimeMs={} result={} actualUp={} futureRet_1={}",
+                    symbol,
+                    previous.getCloseTimeMs(),
+                    result,
+                    actualUp,
+                    futureRet);
+        } catch (Exception ex) {
+            log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, current.getCloseTimeMs(), ex);
         }
     }
 
@@ -254,5 +339,11 @@ public class RawIngestionService implements ApplicationRunner {
             return "UNKNOWN";
         }
         return symbol.toUpperCase(Locale.ROOT);
+    }
+
+    private String formatMs(long epochMs) {
+        return Instant.ofEpochMilli(epochMs)
+                .atZone(ISTANBUL_ZONE)
+                .format(ISO_FORMATTER);
     }
 }

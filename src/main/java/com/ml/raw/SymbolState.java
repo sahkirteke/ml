@@ -14,6 +14,8 @@ public class SymbolState {
     private final Map<String, AtomicLong> prevClosePriceBySymbol = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> lastFeaturesCloseBySymbol = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> lastPredWrittenCloseBySymbol = new ConcurrentHashMap<>();
+    private final Map<String, String> lastPredDecisionBySymbol = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> lastPredPUpBySymbol = new ConcurrentHashMap<>();
 
     public long getLastRawWrittenCloseTimeMs(String symbol) {
         AtomicLong value = lastRawWrittenCloseBySymbol.get(symbol);
@@ -85,6 +87,21 @@ public class SymbolState {
                 return true;
             }
         }
+    }
+
+    public String getLastPredDecision(String symbol) {
+        return lastPredDecisionBySymbol.get(symbol);
+    }
+
+    public Double getLastPredPUp(String symbol) {
+        AtomicLong value = lastPredPUpBySymbol.get(symbol);
+        return value == null ? null : Double.longBitsToDouble(value.get());
+    }
+
+    public void setLastPredInfo(String symbol, String decision, double pUp) {
+        lastPredDecisionBySymbol.put(symbol, decision);
+        lastPredPUpBySymbol.computeIfAbsent(symbol, key -> new AtomicLong(Double.doubleToLongBits(pUp)))
+                .set(Double.doubleToLongBits(pUp));
     }
 
     public long getPrevCloseTimeMs(String symbol) {
