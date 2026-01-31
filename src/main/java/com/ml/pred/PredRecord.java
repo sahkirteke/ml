@@ -14,8 +14,15 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
         "modelVersion",
         "pUp",
         "confidence",
+        "edgeAbs",
         "expectedPct",
+        "expectedBp",
+        "minConfidence",
+        "minAbsExpectedPct",
+        "minAbsEdge",
         "decision",
+        "decisionReason",
+        "failedGate",
         "loggedAtMs",
         "loggedAt"
 })
@@ -30,8 +37,15 @@ public class PredRecord {
     private String modelVersion;
     private double pUp;
     private Double confidence;
+    private Double edgeAbs;
     private Double expectedPct;
+    private Double expectedBp;
+    private Double minConfidence;
+    private Double minAbsExpectedPct;
+    private Double minAbsEdge;
     private String decision;
+    private String decisionReason;
+    private String failedGate;
     private long loggedAtMs;
     private String loggedAt;
 
@@ -107,6 +121,14 @@ public class PredRecord {
         this.confidence = confidence;
     }
 
+    public Double getEdgeAbs() {
+        return edgeAbs;
+    }
+
+    public void setEdgeAbs(Double edgeAbs) {
+        this.edgeAbs = edgeAbs;
+    }
+
     public Double getExpectedPct() {
         return expectedPct;
     }
@@ -115,12 +137,60 @@ public class PredRecord {
         this.expectedPct = expectedPct;
     }
 
+    public Double getExpectedBp() {
+        return expectedBp;
+    }
+
+    public void setExpectedBp(Double expectedBp) {
+        this.expectedBp = expectedBp;
+    }
+
+    public Double getMinConfidence() {
+        return minConfidence;
+    }
+
+    public void setMinConfidence(Double minConfidence) {
+        this.minConfidence = minConfidence;
+    }
+
+    public Double getMinAbsExpectedPct() {
+        return minAbsExpectedPct;
+    }
+
+    public void setMinAbsExpectedPct(Double minAbsExpectedPct) {
+        this.minAbsExpectedPct = minAbsExpectedPct;
+    }
+
+    public Double getMinAbsEdge() {
+        return minAbsEdge;
+    }
+
+    public void setMinAbsEdge(Double minAbsEdge) {
+        this.minAbsEdge = minAbsEdge;
+    }
+
     public String getDecision() {
         return decision;
     }
 
     public void setDecision(String decision) {
         this.decision = decision;
+    }
+
+    public String getDecisionReason() {
+        return decisionReason;
+    }
+
+    public void setDecisionReason(String decisionReason) {
+        this.decisionReason = decisionReason;
+    }
+
+    public String getFailedGate() {
+        return failedGate;
+    }
+
+    public void setFailedGate(String failedGate) {
+        this.failedGate = failedGate;
     }
 
     public long getLoggedAtMs() {
@@ -138,4 +208,5 @@ public class PredRecord {
     public void setLoggedAt(String loggedAt) {
         this.loggedAt = loggedAt;
     }
+
 }

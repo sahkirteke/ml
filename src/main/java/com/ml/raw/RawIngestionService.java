@@ -149,10 +149,6 @@ public class RawIngestionService implements ApplicationRunner {
     }
 
     private void writePrediction(String symbol, FeatureRecord featureRecord) {
-        if (!onnxInferenceService.isAvailable()) {
-            log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs());
-            return;
-        }
         if (!featureRecord.isWindowReady()) {
             log.info("PRED_SKIP_NOT_READY symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs());
             return;
@@ -165,18 +161,24 @@ public class RawIngestionService implements ApplicationRunner {
                     lastPred);
             return;
         }
-        Optional<ModelMeta> meta = onnxModelLoader.getMeta();
-        if (meta.isEmpty()) {
-            log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs());
+        Optional<OnnxModelLoader.ModelBundle> modelOpt = onnxModelLoader.getModel(symbol);
+        if (modelOpt.isEmpty()) {
             return;
         }
+        ModelMeta modelMeta = modelOpt.get().getMeta();
+        if (modelMeta == null) {
+            return;
+        }
+        logPredInputDebug(symbol, featureRecord, modelMeta);
         try {
-            Optional<Double> pUpOpt = onnxInferenceService.predict(featureRecord);
+            Optional<Double> pUpOpt = onnxInferenceService.predict(featureRecord, modelOpt.get());
             if (pUpOpt.isEmpty()) {
-                log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs());
                 return;
             }
             double pUp = pUpOpt.get();
+            double minConfidence = resolveMinConfidence(modelMeta);
+            double minAbsExpectedPct = resolveMinAbsExpectedPct(modelMeta);
+            double minAbsEdge = resolveMinAbsEdge(modelMeta);
             PredRecord predRecord = new PredRecord();
             predRecord.setType("PRED");
             predRecord.setSymbol(symbol);
@@ -184,30 +186,74 @@ public class RawIngestionService implements ApplicationRunner {
             predRecord.setCloseTimeMs(featureRecord.getCloseTimeMs());
             predRecord.setCloseTime(formatMs(featureRecord.getCloseTimeMs()));
             predRecord.setFeaturesVersion(featureRecord.getFeaturesVersion());
-            predRecord.setModelVersion(meta.get().getModelVersion());
+            predRecord.setModelVersion(modelMeta.getModelVersion());
             predRecord.setPUp(pUp);
-            predRecord.setDecision(pUp >= 0.5d ? "UP" : "DOWN");
             predRecord.setLoggedAtMs(System.currentTimeMillis());
             predRecord.setLoggedAt(formatMs(predRecord.getLoggedAtMs()));
             double conf = Math.max(pUp, 1.0d - pUp);
             predRecord.setConfidence(conf);
+            double edgeAbs = Math.abs(pUp - 0.5d);
+            predRecord.setEdgeAbs(edgeAbs);
             Double expectedPct = null;
-            Double meanRetUp = meta.get().getMeanRetUp();
-            Double meanRetDown = meta.get().getMeanRetDown();
+            Double expectedBp = null;
+            Double meanRetUp = modelMeta.getMeanRetUp();
+            Double meanRetDown = modelMeta.getMeanRetDown();
             if (meanRetUp != null && meanRetDown != null) {
                 double expectedRet = pUp * meanRetUp + (1.0d - pUp) * meanRetDown;
-                expectedPct = expectedRet * 100.0d;
+                expectedPct = expectedRet;
                 predRecord.setExpectedPct(expectedPct);
+                expectedBp = expectedPct * 10000.0d;
+                predRecord.setExpectedBp(expectedBp);
             }
+            predRecord.setMinConfidence(minConfidence);
+            predRecord.setMinAbsExpectedPct(minAbsExpectedPct);
+            predRecord.setMinAbsEdge(minAbsEdge);
+            boolean lowExpected = expectedPct != null && Math.abs(expectedPct) < minAbsExpectedPct;
+            boolean lowEdge = edgeAbs < minAbsEdge;
+            String decisionReason = "DIRECT";
+            String failedGate = "NONE";
+            String decision;
+            if (conf < minConfidence) {
+                decision = "NO_TRADE";
+                decisionReason = "LOW_CONF";
+                failedGate = "CONFIDENCE";
+            } else if (lowExpected || lowEdge) {
+                decision = "NO_TRADE";
+                if (lowExpected && lowEdge) {
+                    decisionReason = "LOW_EXPECTED|LOW_EDGE";
+                    failedGate = "EXPECTED+EDGE";
+                } else if (lowExpected) {
+                    decisionReason = "LOW_EXPECTED";
+                    failedGate = "EXPECTED";
+                } else {
+                    decisionReason = "LOW_EDGE";
+                    failedGate = "EDGE";
+                }
+            } else {
+                decision = pUp >= 0.5d ? "UP" : "DOWN";
+            }
+            predRecord.setDecision(decision);
+            predRecord.setDecisionReason(decisionReason);
+            predRecord.setFailedGate(failedGate);
             predWriter.append(predRecord);
-            log.info("PRED symbol={} closeTimeMs={} pUp={} conf={} expectedPct={} decision={} modelVersion={}",
+            log.info(
+                    "PRED symbol={} closeTimeMs={} pUp={} conf={} edgeAbs={} expectedPct={} expectedBp={} "
+                            + "minConfidence={} minAbsExpectedPct={} minAbsEdge={} failedGate={} decision={} "
+                            + "reason={} modelVersion={}",
                     symbol,
                     featureRecord.getCloseTimeMs(),
                     pUp,
                     conf,
+                    edgeAbs,
                     expectedPct,
+                    expectedBp,
+                    minConfidence,
+                    minAbsExpectedPct,
+                    minAbsEdge,
+                    failedGate,
                     predRecord.getDecision(),
-                    meta.get().getModelVersion());
+                    decisionReason,
+                    modelMeta.getModelVersion());
             symbolState.updatePredIfNewer(symbol, featureRecord.getCloseTimeMs());
             symbolState.setLastPredInfo(symbol, predRecord.getDecision(), pUp);
         } catch (Exception ex) {
@@ -258,7 +304,9 @@ public class RawIngestionService implements ApplicationRunner {
         boolean actualUp = futureRet > 0.0d;
         String predDecision = symbolState.getLastPredDecision(symbol);
         String result = "NOK";
-        if ("UP".equalsIgnoreCase(predDecision) && actualUp) {
+        if ("NO_TRADE".equalsIgnoreCase(predDecision)) {
+            result = "SKIP";
+        } else if ("UP".equalsIgnoreCase(predDecision) && actualUp) {
             result = "OK";
         } else if ("DOWN".equalsIgnoreCase(predDecision) && !actualUp) {
             result = "OK";
@@ -339,6 +387,91 @@ public class RawIngestionService implements ApplicationRunner {
             return "UNKNOWN";
         }
         return symbol.toUpperCase(Locale.ROOT);
+    }
+
+    private void logPredInputDebug(String symbol, FeatureRecord featureRecord, ModelMeta meta) {
+        long count = symbolState.incrementPredDebugCount(symbol);
+        if (count > 3) {
+            return;
+        }
+        if (meta.getFeatureOrder() == null || meta.getFeatureOrder().isEmpty()) {
+            return;
+        }
+        StringBuilder builder = new StringBuilder();
+        builder.append("PRED_INPUT_DEBUG symbol=").append(symbol)
+                .append(" closeTimeMs=").append(featureRecord.getCloseTimeMs());
+        int limit = Math.min(8, meta.getFeatureOrder().size());
+        boolean hasNaN = false;
+        for (int i = 0; i < meta.getFeatureOrder().size(); i++) {
+            String name = meta.getFeatureOrder().get(i);
+            Double value = resolveFeatureValue(featureRecord, name);
+            if (value != null && value.isNaN()) {
+                hasNaN = true;
+            }
+            if (i < limit) {
+                builder.append(" f").append(i).append("=")
+                        .append(name)
+                        .append(":")
+                        .append(value == null ? "null" : value);
+            }
+        }
+        builder.append(" hasNaN=").append(hasNaN);
+        log.info(builder.toString());
+    }
+
+    private Double resolveFeatureValue(FeatureRecord record, String name) {
+        return switch (name) {
+            case "ret_1" -> record.getRet_1();
+            case "logRet_1" -> record.getLogRet_1();
+            case "ret_3" -> record.getRet_3();
+            case "ret_12" -> record.getRet_12();
+            case "realizedVol_6" -> record.getRealizedVol_6();
+            case "realizedVol_24" -> record.getRealizedVol_24();
+            case "rangePct" -> record.getRangePct();
+            case "bodyPct" -> record.getBodyPct();
+            case "upperWickPct" -> record.getUpperWickPct();
+            case "lowerWickPct" -> record.getLowerWickPct();
+            case "closePos" -> record.getClosePos();
+            case "volRatio_12" -> record.getVolRatio_12();
+            case "tradeRatio_12" -> record.getTradeRatio_12();
+            case "buySellRatio" -> record.getBuySellRatio();
+            case "deltaVolNorm" -> record.getDeltaVolNorm();
+            case "rsi14" -> record.getRsi14();
+            case "atr14" -> record.getAtr14();
+            case "ema20DistPct" -> record.getEma20DistPct();
+            case "ema200DistPct" -> record.getEma200DistPct();
+            default -> null;
+        };
+    }
+
+    private double resolveMinConfidence(ModelMeta meta) {
+        double fallback = properties.getDecision() == null || properties.getDecision().getMinConfidence() == null
+                ? 0.55d
+                : properties.getDecision().getMinConfidence();
+        if (meta.getDecisionPolicy() != null && meta.getDecisionPolicy().getMinConfidence() != null) {
+            return meta.getDecisionPolicy().getMinConfidence();
+        }
+        return fallback;
+    }
+
+    private double resolveMinAbsExpectedPct(ModelMeta meta) {
+        double fallback = properties.getDecision() == null || properties.getDecision().getMinAbsExpectedPct() == null
+                ? 0.002d
+                : properties.getDecision().getMinAbsExpectedPct();
+        if (meta.getDecisionPolicy() != null && meta.getDecisionPolicy().getMinAbsExpectedPct() != null) {
+            return meta.getDecisionPolicy().getMinAbsExpectedPct();
+        }
+        return fallback;
+    }
+
+    private double resolveMinAbsEdge(ModelMeta meta) {
+        double fallback = properties.getDecision() == null || properties.getDecision().getMinAbsEdge() == null
+                ? 0.05d
+                : properties.getDecision().getMinAbsEdge();
+        if (meta.getDecisionPolicy() != null && meta.getDecisionPolicy().getMinAbsEdge() != null) {
+            return meta.getDecisionPolicy().getMinAbsEdge();
+        }
+        return fallback;
     }
 
     private String formatMs(long epochMs) {

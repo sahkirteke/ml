@@ -1,47 +1,36 @@
 package com.ml.pred;
 
-import ai.onnxruntime.OnnxTensor;
-import ai.onnxruntime.OnnxValue;
-import ai.onnxruntime.OrtException;
-import ai.onnxruntime.OrtSession;
+import ai.onnxruntime.*;
 import com.ml.features.FeatureRecord;
 import java.nio.FloatBuffer;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 @Component
 public class OnnxInferenceService {
+    private static final Logger log = LoggerFactory.getLogger(OnnxInferenceService.class);
 
-    private final OnnxModelLoader modelLoader;
-
-    public OnnxInferenceService(OnnxModelLoader modelLoader) {
-        this.modelLoader = modelLoader;
-    }
-
-    public boolean isAvailable() {
-        return modelLoader.isLoaded();
-    }
-
-    public Optional<Double> predict(FeatureRecord record) throws OrtException {
-        Optional<OrtSession> sessionOpt = modelLoader.getSession();
-        Optional<ModelMeta> metaOpt = modelLoader.getMeta();
-        Optional<ai.onnxruntime.OrtEnvironment> envOpt = modelLoader.getEnvironment();
-        if (sessionOpt.isEmpty() || metaOpt.isEmpty() || envOpt.isEmpty()) {
+    public Optional<Double> predict(FeatureRecord record, OnnxModelLoader.ModelBundle model) throws OrtException {
+        if (model == null || model.getSession() == null || model.getMeta() == null) {
             return Optional.empty();
         }
-        ModelMeta meta = metaOpt.get();
+        ModelMeta meta = model.getMeta();
         List<String> order = meta.getFeatureOrder();
         if (order == null || order.isEmpty()) {
             return Optional.empty();
         }
         float[] inputs = buildInputs(record, order);
-        OrtSession session = sessionOpt.get();
-        String inputName = session.getInputNames().iterator().next();
-        try (OnnxTensor tensor = OnnxTensor.createTensor(envOpt.get(), FloatBuffer.wrap(inputs), new long[] {1, inputs.length});
-             OrtSession.Result result = session.run(Map.of(inputName, tensor))) {
-            return Optional.of(extractProbability(result));
+        String inputName = model.getSession().getInputNames().iterator().next();
+        try (OnnxTensor tensor = OnnxTensor.createTensor(OrtEnvironment.getEnvironment(),
+                FloatBuffer.wrap(inputs),
+                new long[] {1, inputs.length});
+             OrtSession.Result result = model.getSession().run(Map.of(inputName, tensor))) {
+            String probOutput = resolveProbOutputName(meta, model);
+            return Optional.of(extractProbability(result, probOutput, meta.getUpClassIndex()));
         }
     }
 
@@ -79,24 +68,35 @@ public class OnnxInferenceService {
         };
     }
 
-    private double extractProbability(OrtSession.Result result) throws OrtException {
-        for (Map.Entry<String, OnnxValue> entry : result) {
-            OnnxValue value = entry.getValue();
-            if (value instanceof OnnxTensor tensor) {
-                Object raw = tensor.getValue();
-                if (raw instanceof float[][] matrix && matrix.length > 0) {
-                    float[] row = matrix[0];
-                    if (row.length >= 2) {
-                        return row[1];
-                    }
-                    if (row.length == 1) {
-                        return row[0];
-                    }
-                } else if (raw instanceof float[] vector && vector.length > 0) {
-                    return vector.length >= 2 ? vector[1] : vector[0];
+    private String resolveProbOutputName(ModelMeta meta, OnnxModelLoader.ModelBundle model) {
+        if (meta.getProbOutputName() != null && model.getSession().getOutputNames().contains(meta.getProbOutputName())) {
+            return meta.getProbOutputName();
+        }
+        if (model.getSession().getOutputNames().contains("probabilities")) {
+            return "probabilities";
+        }
+        return model.getSession().getOutputNames().iterator().next();
+    }
+
+    private double extractProbability(OrtSession.Result result, String outputName, Integer upClassIndex)
+            throws OrtException {
+        int index = upClassIndex == null ? 1 : upClassIndex;
+        OnnxValue value = result.get(outputName).orElse(null);
+        if (value instanceof OnnxTensor tensor) {
+            Object raw = tensor.getValue();
+            if (raw instanceof float[][] matrix && matrix.length > 0) {
+                float[] row = matrix[0];
+                if (row.length > index) {
+                    return row[index];
                 }
+                if (row.length == 1) {
+                    return row[0];
+                }
+            } else if (raw instanceof float[] vector && vector.length > 0) {
+                return vector.length > index ? vector[index] : vector[0];
             }
         }
+        log.info("ONNX_OUTPUT_MISMATCH outputName={} upClassIndex={}", outputName, index);
         return 0.0d;
     }
 }
