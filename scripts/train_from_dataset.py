@@ -7,7 +7,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
@@ -63,7 +62,7 @@ def find_jsonl_files(
     pattern = re.compile(r"-(\d{8})\.jsonl\.gz$")
     today_ymd = None
     if exclude_today:
-        tz = ZoneInfo("Europe/Istanbul")
+        tz = resolve_istanbul_tz()
         today_ymd = datetime.now(tz=tz).strftime("%Y%m%d")
     paths: list[Path] = []
     for path in root.glob("**/*.jsonl.gz"):
@@ -94,6 +93,19 @@ def extract_dates(paths: Iterable[Path]) -> set[str]:
         if match:
             dates.add(match.group(1))
     return dates
+
+
+def resolve_istanbul_tz():
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        try:
+            from backports.zoneinfo import ZoneInfo
+        except ImportError as exc:
+            raise RuntimeError(
+                "ZoneInfo is required for --exclude-today; install backports.zoneinfo for Python < 3.9."
+            ) from exc
+    return ZoneInfo("Europe/Istanbul")
 
 
 def load_features_labels(
