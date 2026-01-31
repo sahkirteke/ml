@@ -8,11 +8,17 @@ import com.ml.features.LabelWriter;
 import com.ml.features.RollingFeatureState;
 import com.ml.features.RollingFeatureStateRegistry;
 import com.ml.config.RawIngestionProperties;
+import com.ml.pred.ModelMeta;
+import com.ml.pred.OnnxInferenceService;
+import com.ml.pred.OnnxModelLoader;
+import com.ml.pred.PredRecord;
+import com.ml.pred.PredWriter;
 import com.ml.ws.BinanceWsClient;
 import com.ml.ws.KlineEvent;
 import com.ml.ws.KlinePayload;
 import com.ml.ws.WsEnvelope;
 import java.util.Locale;
+import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.ApplicationArguments;
@@ -35,6 +41,9 @@ public class RawIngestionService implements ApplicationRunner {
     private final FeatureCalculator featureCalculator;
     private final FeatureWriter featureWriter;
     private final LabelWriter labelWriter;
+    private final OnnxInferenceService onnxInferenceService;
+    private final OnnxModelLoader onnxModelLoader;
+    private final PredWriter predWriter;
     private final RawIngestionProperties properties;
 
     public RawIngestionService(
@@ -46,6 +55,9 @@ public class RawIngestionService implements ApplicationRunner {
             FeatureCalculator featureCalculator,
             FeatureWriter featureWriter,
             LabelWriter labelWriter,
+            OnnxInferenceService onnxInferenceService,
+            OnnxModelLoader onnxModelLoader,
+            PredWriter predWriter,
             RawIngestionProperties properties
     ) {
         this.wsClient = wsClient;
@@ -56,6 +68,9 @@ public class RawIngestionService implements ApplicationRunner {
         this.featureCalculator = featureCalculator;
         this.featureWriter = featureWriter;
         this.labelWriter = labelWriter;
+        this.onnxInferenceService = onnxInferenceService;
+        this.onnxModelLoader = onnxModelLoader;
+        this.predWriter = predWriter;
         this.properties = properties;
     }
 
@@ -109,14 +124,66 @@ public class RawIngestionService implements ApplicationRunner {
                 state.add(record);
                 symbolState.setPrevClose(symbol, record.getCloseTimeMs(), parseDouble(record.getClosePrice()));
                 FeatureRecord featureRecord = featureCalculator.calculate(state);
-                if (featureRecord != null
-                        && symbolState.updateFeaturesIfNewer(symbol, featureRecord.getCloseTimeMs())) {
-                    featureWriter.append(featureRecord);
+                if (featureRecord != null) {
+                    if (symbolState.updateFeaturesIfNewer(symbol, featureRecord.getCloseTimeMs())) {
+                        featureWriter.append(featureRecord);
+                        writePrediction(symbol, featureRecord);
+                    } else {
+                        log.info("SKIP_DUP symbol={} closeTimeMs={} last={}",
+                                symbol,
+                                featureRecord.getCloseTimeMs(),
+                                symbolState.getLastFeaturesCloseTimeMs(symbol));
+                    }
                 }
             } catch (Exception ex) {
                 throw new RuntimeException(ex);
             }
         });
+    }
+
+    private void writePrediction(String symbol, FeatureRecord featureRecord) {
+        if (!onnxInferenceService.isAvailable()) {
+            log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs());
+            return;
+        }
+        if (!featureRecord.isWindowReady()) {
+            log.info("PRED_SKIP_NOT_READY symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs());
+            return;
+        }
+        long lastPred = symbolState.getLastPredCloseTimeMs(symbol);
+        if (featureRecord.getCloseTimeMs() <= lastPred) {
+            log.info("PRED_SKIP_DUP symbol={} closeTimeMs={} last={}",
+                    symbol,
+                    featureRecord.getCloseTimeMs(),
+                    lastPred);
+            return;
+        }
+        Optional<ModelMeta> meta = onnxModelLoader.getMeta();
+        if (meta.isEmpty()) {
+            log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs());
+            return;
+        }
+        try {
+            Optional<Double> pUpOpt = onnxInferenceService.predict(featureRecord);
+            if (pUpOpt.isEmpty()) {
+                log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs());
+                return;
+            }
+            double pUp = pUpOpt.get();
+            PredRecord predRecord = new PredRecord();
+            predRecord.setSymbol(symbol);
+            predRecord.setTf(featureRecord.getTf());
+            predRecord.setCloseTimeMs(featureRecord.getCloseTimeMs());
+            predRecord.setFeaturesVersion(featureRecord.getFeaturesVersion());
+            predRecord.setModelVersion(meta.get().getModelVersion());
+            predRecord.setPUp(pUp);
+            predRecord.setDecision(pUp >= 0.5d ? "UP" : "DOWN");
+            predRecord.setLoggedAtMs(System.currentTimeMillis());
+            predWriter.append(predRecord);
+            symbolState.updatePredIfNewer(symbol, featureRecord.getCloseTimeMs());
+        } catch (Exception ex) {
+            log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs(), ex);
+        }
     }
 
     private LabelRecord buildLabel(RollingFeatureState state, RawRecord current) {
@@ -136,7 +203,7 @@ public class RawIngestionService implements ApplicationRunner {
         long expectedGap = properties.getExpectedGapMs() == null ? 300_000L : properties.getExpectedGapMs();
         long gapMs = current.getCloseTimeMs() - previous.getCloseTimeMs();
         if (gapMs != expectedGap) {
-            log.info("SKIP_GAP symbol={} prevCloseTimeMs={} closeTimeMs={} gapMs={} expectedGapMs={}",
+            log.info("SKIP_GAP_LABEL symbol={} prevCloseTimeMs={} closeTimeMs={} gapMs={} expectedGapMs={}",
                     current.getSymbol(),
                     previous.getCloseTimeMs(),
                     current.getCloseTimeMs(),

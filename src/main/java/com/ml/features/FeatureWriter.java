@@ -27,7 +27,7 @@ public class FeatureWriter {
         try {
             Path file = appender.appendFeature(record);
             String partition = partitionResolver.resolveDate(record.getCloseTimeMs());
-            log.debug("FEATURE_WRITE symbol={} closeTimeMs={} partition={} windowReady={}",
+            log.info("FEATURE_WRITE symbol={} closeTimeMs={} partition={} windowReady={}",
                     record.getSymbol(),
                     record.getCloseTimeMs(),
                     partition,

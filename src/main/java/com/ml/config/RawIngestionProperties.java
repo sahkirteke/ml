@@ -39,6 +39,9 @@ public class RawIngestionProperties {
     private Path trainDir = Path.of("data", "train");
 
     @NotNull
+    private Path modelDir = Path.of("models", "current");
+
+    @NotNull
     private Long expectedGapMs = 300_000L;
 
     private boolean parityEnabled = false;
@@ -112,6 +115,14 @@ public class RawIngestionProperties {
 
     public void setTrainDir(Path trainDir) {
         this.trainDir = trainDir;
+    }
+
+    public Path getModelDir() {
+        return modelDir;
+    }
+
+    public void setModelDir(Path modelDir) {
+        this.modelDir = modelDir;
     }
 
     public Long getExpectedGapMs() {
