@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse
+import itertools
 import json
+import math
 import re
 import time
 import warnings
@@ -11,12 +13,10 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, confusion_matrix
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from skl2onnx import convert_sklearn
@@ -50,6 +50,8 @@ MAX_HORIZON_BARS = 7
 TP_PCT = 0.004
 SL_PCT = 0.002
 GAP_MS = 300000
+CONF_THRESHOLD = 0.55
+TRAIN_LIMIT = 200000
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,11 +62,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols", default=None, help="Comma-separated symbols to include")
     parser.add_argument("--min-rows-per-symbol", default=20000, type=int, help="Minimum rows required to train")
     parser.add_argument("--train-rows", default=None, type=int, help="Rows to use for training (most recent)")
-    parser.add_argument("--train-grid", default=None, help="Comma-separated train row sizes to evaluate")
-    parser.add_argument("--test-rows", default=2000, type=int, help="Rows to hold out for evaluation")
+    parser.add_argument("--test-rows", default=100000, type=int, help="Rows to hold out for evaluation")
+    parser.add_argument("--val-rows", default=50000, type=int, help="Rows to hold out for validation")
+    parser.add_argument("--auto-tune", action="store_true", help="Enable hyperparameter tuning")
+    parser.add_argument("--max-trials", default=40, type=int, help="Maximum tuning trials")
+    parser.add_argument("--target-acc", default=0.65, type=float, help="Target accHi to stop tuning")
+    parser.add_argument("--min-coverage", default=0.0005, type=float, help="Minimum coverage to stop tuning")
+    parser.add_argument("--conf-threshold", default=CONF_THRESHOLD, type=float, help="Confidence threshold")
     parser.add_argument("--eval-only", action="store_true", help="Only run evaluation (skip export)")
     parser.add_argument("--fast-tail", action="store_true", help="Read only the latest rows needed")
-    parser.add_argument("--calibrate", action="store_true", help="Enable probability calibration")
     return parser.parse_args()
 
 
@@ -137,18 +143,15 @@ def load_feature_frames(
     if not fast_tail or need_rows is None:
         feature_frames = [read_jsonl_gz(path) for path in feature_files]
         return pd.concat(feature_frames, ignore_index=True), feature_files
-    collected: list[pd.DataFrame] = []
-    total_rows = 0
-    for path in reversed(feature_files):
-        frame = read_jsonl_gz(path)
-        collected.append(frame)
-        total_rows += len(frame)
-        if total_rows >= need_rows:
-            break
-    if not collected:
-        return pd.DataFrame(), feature_files
-    features = pd.concat(reversed(collected), ignore_index=True)
-    return features, feature_files
+    need_days = int(math.ceil(need_rows / 288))
+    selected_files = feature_files[-need_days:]
+    print(
+        "FAST_TAIL symbol={} needRows={} needDays={} files={}".format(
+            symbol, need_rows, need_days, len(selected_files)
+        )
+    )
+    feature_frames = [read_jsonl_gz(path) for path in selected_files]
+    return pd.concat(feature_frames, ignore_index=True), selected_files
 
 
 def load_raw_frames(
@@ -172,18 +175,16 @@ def load_raw_frames(
         raw_frames = [read_jsonl_gz(path) for path in raw_files]
         raw = pd.concat(raw_frames, ignore_index=True)
         return raw, raw_files
-    collected: list[pd.DataFrame] = []
-    total_rows = 0
-    for path in reversed(raw_files):
-        frame = read_jsonl_gz(path)
-        collected.append(frame)
-        total_rows += len(frame)
-        if total_rows >= need_rows:
-            break
-    if not collected:
-        return pd.DataFrame(), raw_files
-    raw = pd.concat(reversed(collected), ignore_index=True)
-    return raw, raw_files
+    need_days = int(math.ceil(need_rows / 288))
+    selected_files = raw_files[-need_days:]
+    print(
+        "FAST_TAIL_RAW symbol={} needRows={} needDays={} files={}".format(
+            symbol, need_rows, need_days, len(selected_files)
+        )
+    )
+    raw_frames = [read_jsonl_gz(path) for path in selected_files]
+    raw = pd.concat(raw_frames, ignore_index=True)
+    return raw, selected_files
 
 
 def build_labels_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
@@ -283,6 +284,7 @@ def build_training_frame(
     )
     if merged.empty:
         raise RuntimeError("No rows available after joining features and labels")
+    merged = merged.sort_values("closeTimeMs").reset_index(drop=True)
     missing_features = [col for col in FEATURE_ORDER if col not in merged.columns]
     if missing_features:
         raise RuntimeError(f"Missing expected feature columns: {missing_features}")
@@ -298,16 +300,36 @@ def build_training_frame(
     return x, y, merged, list(x.columns)
 
 
-def build_pipeline(solver: str) -> Pipeline:
+def build_pipeline(
+    solver: str,
+    *,
+    c_value: float = 1.0,
+    class_weight: str | None = None,
+    max_iter: int = 4000,
+    tol: float = 1e-4,
+) -> Pipeline:
     scaler = StandardScaler()
     base_steps = [
         ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
         ("scaler", scaler),
     ]
     if solver == "saga":
-        lr = LogisticRegression(solver="saga", max_iter=4000, tol=1e-4, n_jobs=-1)
+        lr = LogisticRegression(
+            solver="saga",
+            max_iter=max_iter,
+            tol=tol,
+            n_jobs=-1,
+            C=c_value,
+            class_weight=class_weight,
+        )
     else:
-        lr = LogisticRegression(solver="lbfgs", max_iter=4000, tol=1e-4)
+        lr = LogisticRegression(
+            solver="lbfgs",
+            max_iter=max_iter,
+            tol=tol,
+            C=c_value,
+            class_weight=class_weight,
+        )
     return Pipeline(base_steps + [("classifier", lr)])
 
 
@@ -342,6 +364,14 @@ def write_meta(
     last_eval_acc_all: float,
     best_train_rows: int,
     test_rows: int,
+    best_params: dict[str, object],
+    conf_threshold: float,
+    target_acc: float,
+    min_coverage: float,
+    test_acc_hi: float,
+    test_coverage: float,
+    test_acc_all: float,
+    val_rows: int,
 ) -> None:
     def _json_default(o):
         if isinstance(o, np.integer):
@@ -372,11 +402,19 @@ def write_meta(
         "maxHorizonBars": MAX_HORIZON_BARS,
         "classes": classes,
         "upClassIndex": up_class_index,
+        "bestParams": best_params,
+        "confThreshold": conf_threshold,
+        "targetAcc": target_acc,
+        "minCoverage": min_coverage,
         "lastEvalAccHi": last_eval_acc_hi,
         "lastEvalCoverage": last_eval_coverage,
         "lastEvalAccAll": last_eval_acc_all,
         "bestTrainRows": best_train_rows,
+        "valRows": val_rows,
         "testRows": test_rows,
+        "testAccHi": test_acc_hi,
+        "testCoverage": test_coverage,
+        "testAccAll": test_acc_all,
         "onnxOutputs": onnx_outputs,
         "probOutputName": prob_output_name,
         "decisionPolicy": {
@@ -408,43 +446,27 @@ def write_current(model_dir: Path, out_dir: Path, symbol: str) -> None:
     meta_tmp.replace(meta_dst)
 
 
-def parse_train_grid(value: str | None) -> list[int] | None:
-    if not value:
-        return None
-    parsed = []
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        parsed.append(int(item))
-    return parsed or None
-
-
-def evaluate_model(
-    model: Pipeline,
-    x_test: pd.DataFrame,
-    y_test: pd.Series,
+def compute_metrics(
+    y_true: pd.Series,
+    preds: np.ndarray,
+    proba: np.ndarray,
+    *,
+    conf_threshold: float,
 ) -> tuple[float, float, float, dict[str, int], float]:
-    proba = model.predict_proba(x_test)
-    classes = list(model.named_steps["classifier"].classes_)
-    if 1 not in classes:
-        raise RuntimeError(f"Class 1 missing from classes: {classes}")
-    pos_index = classes.index(1)
-    preds = model.predict(x_test)
-    acc_all = float(accuracy_score(y_test, preds))
-    p_hit = proba[:, pos_index]
+    acc_all = float(accuracy_score(y_true, preds))
+    p_hit = proba
     confidence = np.maximum(p_hit, 1.0 - p_hit)
-    coverage_mask = confidence >= 0.55
+    coverage_mask = confidence >= conf_threshold
     coverage = float(np.mean(coverage_mask)) if len(confidence) else 0.0
     if np.any(coverage_mask):
-        acc_hi = float(accuracy_score(y_test[coverage_mask], preds[coverage_mask]))
+        acc_hi = float(accuracy_score(y_true[coverage_mask], preds[coverage_mask]))
     else:
-        acc_hi = 0.0
-    matrix = confusion_matrix(y_test, preds, labels=[0, 1]).tolist()
+        acc_hi = float("nan")
+    matrix = confusion_matrix(y_true, preds, labels=[0, 1]).tolist()
     tn, fp = matrix[0]
     fn, tp = matrix[1]
     confusion = {"tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn)}
-    win_rate = float(np.mean(y_test)) if len(y_test) else 0.0
+    win_rate = float(np.mean(y_true)) if len(y_true) else 0.0
     return acc_all, coverage, acc_hi, confusion, win_rate
 
 
@@ -457,16 +479,9 @@ def main() -> None:
         if not features_root.exists():
             raise RuntimeError(f"No features directory found at {features_root}")
         symbols = sorted([path.name.upper() for path in features_root.iterdir() if path.is_dir()])
-    train_grid = parse_train_grid(args.train_grid)
     for symbol in symbols:
-        if train_grid:
-            max_train_rows = max(train_grid)
-        else:
-            max_train_rows = args.train_rows
-        if args.test_rows:
-            need_rows = (max_train_rows or 0) + args.test_rows + MAX_HORIZON_BARS + 1
-        else:
-            need_rows = None
+        max_train_rows = args.train_rows or TRAIN_LIMIT
+        need_rows = max_train_rows + args.val_rows + args.test_rows + MAX_HORIZON_BARS + 1
         features, feature_files = load_feature_frames(
             args.data_dir,
             symbol,
@@ -488,9 +503,9 @@ def main() -> None:
         if len(x) < args.min_rows_per_symbol:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} min={args.min_rows_per_symbol}")
             continue
-        if args.test_rows <= 0:
-            raise RuntimeError("--test-rows must be > 0")
-        if len(x) <= args.test_rows:
+        if args.test_rows <= 0 or args.val_rows <= 0:
+            raise RuntimeError("--test-rows and --val-rows must be > 0")
+        if len(x) <= args.test_rows + args.val_rows:
             print(
                 f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} "
                 f"min={args.min_rows_per_symbol}"
@@ -499,102 +514,143 @@ def main() -> None:
         x = x.reset_index(drop=True)
         y = y.reset_index(drop=True)
         test_rows = args.test_rows
+        val_rows = args.val_rows
         test_start = len(x) - test_rows
-        x_train_pool = x.iloc[:test_start]
-        y_train_pool = y.iloc[:test_start]
+        val_start = test_start - val_rows
+        x_train_pool = x.iloc[:val_start]
+        y_train_pool = y.iloc[:val_start]
+        x_val = x.iloc[val_start:test_start]
+        y_val = y.iloc[val_start:test_start]
         x_test = x.iloc[test_start:]
         y_test = y.iloc[test_start:]
-        train_grid_values = train_grid or ([args.train_rows] if args.train_rows else [len(x_train_pool)])
+        if len(x_train_pool) > TRAIN_LIMIT:
+            x_train_pool = x_train_pool.iloc[-TRAIN_LIMIT:]
+            y_train_pool = y_train_pool.iloc[-TRAIN_LIMIT:]
+        conf_threshold = args.conf_threshold
         best = None
-        for train_rows in train_grid_values:
-            if train_rows is None:
-                train_rows = len(x_train_pool)
-            if train_rows > len(x_train_pool):
-                print(
-                    f"SKIP_TRAIN_GRID symbol={symbol} train={train_rows} available={len(x_train_pool)}"
+        if args.auto_tune:
+            trial_params = list(
+                itertools.product(
+                    [0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
+                    [None, "balanced"],
+                    ["lbfgs", "saga"],
+                    [2000, 4000],
+                    [1e-4, 1e-3],
                 )
-                continue
-            x_train = x_train_pool.iloc[len(x_train_pool) - train_rows :]
-            y_train = y_train_pool.iloc[len(y_train_pool) - train_rows :]
-            base_pipeline = build_pipeline("lbfgs")
-            print(
-                "MODEL_CONFIG symbol={} solver=lbfgs max_iter=4000 scaler=StandardScaler train_rows={}".format(
-                    symbol, train_rows
-                )
+            )
+            max_trials = min(args.max_trials, len(trial_params))
+        else:
+            trial_params = [(1.0, None, "lbfgs", 4000, 1e-4)]
+            max_trials = 1
+        for trial_index in range(max_trials):
+            c_value, class_weight, solver, max_iter, tol = trial_params[trial_index]
+            params = {
+                "C": c_value,
+                "class_weight": class_weight,
+                "solver": solver,
+                "max_iter": max_iter,
+                "tol": tol,
+            }
+            base_pipeline = build_pipeline(
+                solver,
+                c_value=c_value,
+                class_weight=class_weight,
+                max_iter=max_iter,
+                tol=tol,
             )
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ConvergenceWarning)
-                base_pipeline.fit(x_train, y_train)
+                base_pipeline.fit(x_train_pool, y_train_pool)
             has_convergence_warning = any(
                 isinstance(warning.message, ConvergenceWarning) for warning in caught
             )
             if has_convergence_warning:
                 print(
-                    "WARN_CONVERGENCE symbol={} solver=lbfgs fallback_solver=saga".format(symbol)
-                )
-                base_pipeline = build_pipeline("saga")
-                print(
-                    "MODEL_CONFIG symbol={} solver=saga max_iter=4000 scaler=StandardScaler train_rows={}".format(
-                        symbol, train_rows
+                    "WARN_CONVERGENCE symbol={} solver={} max_iter={} tol={}".format(
+                        symbol, solver, max_iter, tol
                     )
                 )
-                base_pipeline.fit(x_train, y_train)
-            calibrated = None
-            if args.calibrate:
-                tscv = TimeSeriesSplit(n_splits=3)
-                calibrated = CalibratedClassifierCV(
-                    estimator=base_pipeline, method="sigmoid", cv=tscv
-                )
-                calibrated.fit(x_train, y_train)
-            model_for_eval = calibrated if calibrated is not None else base_pipeline
-            acc_all, coverage, acc_hi, confusion, win_rate = evaluate_model(
-                model_for_eval, x_test, y_test
+            val_proba = base_pipeline.predict_proba(x_val)
+            classes = list(base_pipeline.named_steps["classifier"].classes_)
+            if 1 not in classes:
+                raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
+            pos_index = classes.index(1)
+            p_hit = val_proba[:, pos_index]
+            val_preds = base_pipeline.predict(x_val)
+            acc_all, coverage, acc_hi, _, _ = compute_metrics(
+                y_val,
+                val_preds,
+                p_hit,
+                conf_threshold=conf_threshold,
             )
             print(
-                "EVAL symbol={} train={} test={} acc={:.6f} coverage={:.6f} accHi={:.6f} winRate={:.6f}".format(
-                    symbol, train_rows, test_rows, acc_all, coverage, acc_hi, win_rate
-                )
-            )
-            print(
-                "CONFUSION symbol={} train={} tp={} tn={} fp={} fn={}".format(
+                "TUNE symbol={} trial={} params={} accAll={:.6f} accHi={} coverage={:.6f}".format(
                     symbol,
-                    train_rows,
-                    confusion["tp"],
-                    confusion["tn"],
-                    confusion["fp"],
-                    confusion["fn"],
+                    trial_index + 1,
+                    params,
+                    acc_all,
+                    "nan" if np.isnan(acc_hi) else f"{acc_hi:.6f}",
+                    coverage,
                 )
             )
-            metric = (acc_hi, acc_all, coverage)
+            score_acc_hi = -1.0 if np.isnan(acc_hi) else acc_hi
+            metric = (score_acc_hi, coverage, acc_all)
             if best is None or metric > best["metric"]:
                 best = {
                     "metric": metric,
-                    "train_rows": train_rows,
-                    "base_model": base_pipeline,
-                    "calibrated_model": calibrated,
+                    "params": params,
+                    "model": base_pipeline,
                     "acc_all": acc_all,
                     "coverage": coverage,
                     "acc_hi": acc_hi,
-                    "win_rate": win_rate,
+                    "trial_index": trial_index + 1,
                 }
+            if score_acc_hi >= args.target_acc and coverage >= args.min_coverage:
+                break
         if best is None:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} min={args.min_rows_per_symbol}")
             continue
-        model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
-        model_dir = args.out_dir / symbol / model_version
-        classifier = best["base_model"].named_steps["classifier"]
-        classes = list(getattr(classifier, "classes_", []))
-        if not classes:
-            raise RuntimeError(f"No classes_ found for symbol {symbol}")
+        best_params = best["params"]
+        final_model = build_pipeline(
+            best_params["solver"],
+            c_value=best_params["C"],
+            class_weight=best_params["class_weight"],
+            max_iter=best_params["max_iter"],
+            tol=best_params["tol"],
+        )
+        train_val_x = pd.concat([x_train_pool, x_val], axis=0)
+        train_val_y = pd.concat([y_train_pool, y_val], axis=0)
+        final_model.fit(train_val_x, train_val_y)
+        test_proba = final_model.predict_proba(x_test)
+        classes = list(final_model.named_steps["classifier"].classes_)
         if 1 not in classes:
             raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
         up_class_index = classes.index(1)
-        best_train_rows = int(best["train_rows"])
-        export_model = best["calibrated_model"] if best["calibrated_model"] is not None else best["base_model"]
+        test_p_hit = test_proba[:, up_class_index]
+        test_preds = final_model.predict(x_test)
+        test_acc_all, test_coverage, test_acc_hi, _, _ = compute_metrics(
+            y_test,
+            test_preds,
+            test_p_hit,
+            conf_threshold=conf_threshold,
+        )
+        print(
+            "FINAL symbol={} bestTrial={} bestParams={} testAccAll={:.6f} testAccHi={} testCoverage={:.6f}".format(
+                symbol,
+                best["trial_index"],
+                best_params,
+                test_acc_all,
+                "nan" if np.isnan(test_acc_hi) else f"{test_acc_hi:.6f}",
+                test_coverage,
+            )
+        )
+        model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+        model_dir = args.out_dir / symbol / model_version
+        export_model = final_model
         if args.eval_only:
             print(
-                "EVAL_ONLY symbol={} train_rows={} test_rows={}".format(
-                    symbol, best_train_rows, test_rows
+                "EVAL_ONLY symbol={} train_rows={} val_rows={} test_rows={}".format(
+                    symbol, len(train_val_x), val_rows, test_rows
                 )
             )
             continue
@@ -602,8 +658,8 @@ def main() -> None:
             input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
             print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
         except Exception as exc:
-            print(f"ONNX_EXPORT_FAILED symbol={symbol} calibrated failed ({exc}); fallback: export non-calibrated.")
-            export_model = best["base_model"]
+            print(f"ONNX_EXPORT_FAILED symbol={symbol} error=({exc}); fallback: export base model.")
+            export_model = final_model
             input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
             print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
         prob_output_name = "probabilities" if "probabilities" in output_names else None
@@ -633,25 +689,32 @@ def main() -> None:
             model_version,
             symbol,
             train_days,
-            best_train_rows,
+            len(train_val_x),
             [int(value) for value in classes],
             up_class_index,
             feature_order,
             output_names,
             prob_output_name,
-            best["acc_hi"],
-            best["coverage"],
-            best["acc_all"],
-            best_train_rows,
+            0.0 if np.isnan(best["acc_hi"]) else float(best["acc_hi"]),
+            float(best["coverage"]),
+            float(best["acc_all"]),
+            len(train_val_x),
             test_rows,
+            best_params,
+            conf_threshold,
+            args.target_acc,
+            args.min_coverage,
+            0.0 if np.isnan(test_acc_hi) else float(test_acc_hi),
+            float(test_coverage),
+            float(test_acc_all),
+            val_rows,
         )
         write_current(model_dir, args.out_dir, symbol)
         wrote_path = args.out_dir / symbol / "current"
         print(
-            "TRAIN_SYMBOL symbol={} rows={} calibrated={} wrote={}".format(
+            "TRAIN_SYMBOL symbol={} rows={} wrote={}".format(
                 symbol,
-                best_train_rows,
-                args.calibrate,
+                len(train_val_x),
                 wrote_path,
             )
         )
