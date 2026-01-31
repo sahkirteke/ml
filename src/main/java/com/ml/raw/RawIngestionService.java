@@ -7,6 +7,7 @@ import com.ml.features.LabelRecord;
 import com.ml.features.LabelWriter;
 import com.ml.features.RollingFeatureState;
 import com.ml.features.RollingFeatureStateRegistry;
+import com.ml.config.RawIngestionProperties;
 import com.ml.ws.BinanceWsClient;
 import com.ml.ws.KlineEvent;
 import com.ml.ws.KlinePayload;
@@ -34,6 +35,7 @@ public class RawIngestionService implements ApplicationRunner {
     private final FeatureCalculator featureCalculator;
     private final FeatureWriter featureWriter;
     private final LabelWriter labelWriter;
+    private final RawIngestionProperties properties;
 
     public RawIngestionService(
             BinanceWsClient wsClient,
@@ -43,7 +45,8 @@ public class RawIngestionService implements ApplicationRunner {
             RollingFeatureStateRegistry stateRegistry,
             FeatureCalculator featureCalculator,
             FeatureWriter featureWriter,
-            LabelWriter labelWriter
+            LabelWriter labelWriter,
+            RawIngestionProperties properties
     ) {
         this.wsClient = wsClient;
         this.recordBuilder = recordBuilder;
@@ -53,6 +56,7 @@ public class RawIngestionService implements ApplicationRunner {
         this.featureCalculator = featureCalculator;
         this.featureWriter = featureWriter;
         this.labelWriter = labelWriter;
+        this.properties = properties;
     }
 
     @Override
@@ -122,7 +126,7 @@ public class RawIngestionService implements ApplicationRunner {
             return null;
         }
         double futureRet = currentClose / prevClose - 1.0d;
-        long expectedGap = 300_000L;
+        long expectedGap = properties.getExpectedGapMs() == null ? 300_000L : properties.getExpectedGapMs();
         long gapMs = current.getCloseTimeMs() - previous.getCloseTimeMs();
         LabelRecord label = new LabelRecord();
         label.setSymbol(current.getSymbol());

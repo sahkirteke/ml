@@ -33,6 +33,21 @@ public class RawIngestionProperties {
     private String featuresVersion = "v1";
 
     @NotNull
+    private Path baselineDir = Path.of("data_baseline");
+
+    @NotNull
+    private Path trainDir = Path.of("data", "train");
+
+    @NotNull
+    private Long expectedGapMs = 300_000L;
+
+    private boolean parityEnabled = false;
+
+    private String parityDate;
+
+    private String paritySymbol;
+
+    @NotNull
     private BigDecimal eps = new BigDecimal("1e-12");
 
     public List<String> getSymbols() {
@@ -81,6 +96,54 @@ public class RawIngestionProperties {
 
     public void setFeaturesVersion(String featuresVersion) {
         this.featuresVersion = featuresVersion;
+    }
+
+    public Path getBaselineDir() {
+        return baselineDir;
+    }
+
+    public void setBaselineDir(Path baselineDir) {
+        this.baselineDir = baselineDir;
+    }
+
+    public Path getTrainDir() {
+        return trainDir;
+    }
+
+    public void setTrainDir(Path trainDir) {
+        this.trainDir = trainDir;
+    }
+
+    public Long getExpectedGapMs() {
+        return expectedGapMs;
+    }
+
+    public void setExpectedGapMs(Long expectedGapMs) {
+        this.expectedGapMs = expectedGapMs;
+    }
+
+    public boolean isParityEnabled() {
+        return parityEnabled;
+    }
+
+    public void setParityEnabled(boolean parityEnabled) {
+        this.parityEnabled = parityEnabled;
+    }
+
+    public String getParityDate() {
+        return parityDate;
+    }
+
+    public void setParityDate(String parityDate) {
+        this.parityDate = parityDate;
+    }
+
+    public String getParitySymbol() {
+        return paritySymbol;
+    }
+
+    public void setParitySymbol(String paritySymbol) {
+        this.paritySymbol = paritySymbol;
     }
 
     public BigDecimal getEps() {
