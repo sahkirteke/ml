@@ -39,6 +39,7 @@ public class RawRecord {
     private long tradeCount;
     private String takerBuyBaseVol;
     private String takerBuyQuoteVol;
+    @com.fasterxml.jackson.annotation.JsonProperty("isFinal")
     private boolean isFinal;
     private long receivedAtMs;
     private String sellBaseVol;
