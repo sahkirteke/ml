@@ -1,10 +1,16 @@
 spring.application.name: ml
 
-raw:
+ml:
   symbols:
     - MANAUSDT
     - XRPUSDT
   tf: 5m
   data-dir: data
-  partition-zone: UTC
+  partition-zone: Europe/Istanbul
+  warmup-bars: 500
+  features-version: ftr_5m_v1
+  baseline-dir: data_baseline
+  train-dir: data/train
+  expected-gap-ms: 300000
+  parity-enabled: false
   eps: 1e-12

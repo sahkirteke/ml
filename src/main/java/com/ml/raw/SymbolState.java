@@ -8,15 +8,19 @@ import org.springframework.stereotype.Component;
 @Component
 public class SymbolState {
 
-    private final Map<String, AtomicLong> lastCloseBySymbol = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> lastRawWrittenCloseBySymbol = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> lastLabelWrittenCloseBySymbol = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> prevCloseTimeBySymbol = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> prevClosePriceBySymbol = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> lastFeaturesCloseBySymbol = new ConcurrentHashMap<>();
 
-    public long getLastCloseTimeMs(String symbol) {
-        AtomicLong value = lastCloseBySymbol.get(symbol);
+    public long getLastRawWrittenCloseTimeMs(String symbol) {
+        AtomicLong value = lastRawWrittenCloseBySymbol.get(symbol);
         return value == null ? -1L : value.get();
     }
 
-    public boolean updateIfNewer(String symbol, long closeTimeMs) {
-        AtomicLong current = lastCloseBySymbol.computeIfAbsent(symbol, key -> new AtomicLong(-1L));
+    public boolean updateRawIfNewer(String symbol, long closeTimeMs) {
+        AtomicLong current = lastRawWrittenCloseBySymbol.computeIfAbsent(symbol, key -> new AtomicLong(-1L));
         while (true) {
             long existing = current.get();
             if (closeTimeMs <= existing) {
@@ -26,5 +30,57 @@ public class SymbolState {
                 return true;
             }
         }
+    }
+
+    public long getLastFeaturesCloseTimeMs(String symbol) {
+        AtomicLong value = lastFeaturesCloseBySymbol.get(symbol);
+        return value == null ? -1L : value.get();
+    }
+
+    public boolean updateFeaturesIfNewer(String symbol, long closeTimeMs) {
+        AtomicLong current = lastFeaturesCloseBySymbol.computeIfAbsent(symbol, key -> new AtomicLong(-1L));
+        while (true) {
+            long existing = current.get();
+            if (closeTimeMs <= existing) {
+                return false;
+            }
+            if (current.compareAndSet(existing, closeTimeMs)) {
+                return true;
+            }
+        }
+    }
+
+    public long getLastLabelsCloseTimeMs(String symbol) {
+        AtomicLong value = lastLabelWrittenCloseBySymbol.get(symbol);
+        return value == null ? -1L : value.get();
+    }
+
+    public boolean updateLabelsIfNewer(String symbol, long closeTimeMs) {
+        AtomicLong current = lastLabelWrittenCloseBySymbol.computeIfAbsent(symbol, key -> new AtomicLong(-1L));
+        while (true) {
+            long existing = current.get();
+            if (closeTimeMs <= existing) {
+                return false;
+            }
+            if (current.compareAndSet(existing, closeTimeMs)) {
+                return true;
+            }
+        }
+    }
+
+    public long getPrevCloseTimeMs(String symbol) {
+        AtomicLong value = prevCloseTimeBySymbol.get(symbol);
+        return value == null ? -1L : value.get();
+    }
+
+    public double getPrevClosePrice(String symbol) {
+        AtomicLong value = prevClosePriceBySymbol.get(symbol);
+        return value == null ? 0.0d : Double.longBitsToDouble(value.get());
+    }
+
+    public void setPrevClose(String symbol, long closeTimeMs, double closePrice) {
+        prevCloseTimeBySymbol.computeIfAbsent(symbol, key -> new AtomicLong(-1L)).set(closeTimeMs);
+        prevClosePriceBySymbol.computeIfAbsent(symbol, key -> new AtomicLong(0L))
+                .set(Double.doubleToLongBits(closePrice));
     }
 }

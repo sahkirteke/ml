@@ -1,8 +1,9 @@
 package com.ml.raw;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ml.config.RawIngestionProperties;
+import com.ml.features.FeatureRecord;
+import com.ml.features.LabelRecord;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
@@ -34,25 +35,38 @@ public class GzipJsonlAppender {
     }
 
     public Path append(RawRecord record) throws IOException {
-        String symbol = record.getSymbol().toUpperCase();
-        String date = partitionResolver.resolveDate(record.getCloseTimeMs());
-        Path symbolDir = properties.getDataDir().resolve("raw").resolve(symbol);
+        Path file = appendPayload("raw", record.getSymbol(), record.getCloseTimeMs(), record);
+        String partition = partitionResolver.resolveDate(record.getCloseTimeMs());
+        log.debug("RAW_WRITE symbol={} closeTimeMs={} partition={}",
+                record.getSymbol(),
+                record.getCloseTimeMs(),
+                partition);
+        return file;
+    }
+
+    public Path appendFeature(FeatureRecord record) throws IOException {
+        return appendPayload("features", record.getSymbol(), record.getCloseTimeMs(), record);
+    }
+
+    public Path appendLabel(LabelRecord record) throws IOException {
+        return appendPayload("labels", record.getSymbol(), record.getCloseTimeMs(), record);
+    }
+
+    private Path appendPayload(String category, String symbol, long closeTimeMs, Object payload) throws IOException {
+        String normalized = symbol.toUpperCase();
+        String date = partitionResolver.resolveDate(closeTimeMs);
+        Path symbolDir = properties.getDataDir().resolve(category).resolve(normalized);
         Files.createDirectories(symbolDir);
         String tf = properties.getTf();
-        Path file = symbolDir.resolve(symbol + "-" + tf + "-" + date + ".jsonl.gz");
-        String payload = toJson(record);
+        Path file = symbolDir.resolve(normalized + "-" + tf + "-" + date + ".jsonl.gz");
+        String json = objectMapper.writeValueAsString(payload);
         try (GZIPOutputStream gzip = new GZIPOutputStream(Files.newOutputStream(file,
                 java.nio.file.StandardOpenOption.CREATE,
                 java.nio.file.StandardOpenOption.APPEND));
              BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(gzip, StandardCharsets.UTF_8))) {
-            writer.write(payload);
+            writer.write(json);
             writer.newLine();
         }
-        log.info("RAW_WRITE symbol={} closeTimeMs={} file={}", symbol, record.getCloseTimeMs(), file);
         return file;
-    }
-
-    private String toJson(RawRecord record) throws JsonProcessingException {
-        return objectMapper.writeValueAsString(record);
     }
 }
