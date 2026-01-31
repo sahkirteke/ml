@@ -1,9 +1,6 @@
 package com.ml.pred;
 
-import ai.onnxruntime.OnnxTensor;
-import ai.onnxruntime.OnnxValue;
-import ai.onnxruntime.OrtEnvironment;
-import ai.onnxruntime.OrtException;
+import ai.onnxruntime.*;
 import com.ml.features.FeatureRecord;
 import java.nio.FloatBuffer;
 import java.util.List;
