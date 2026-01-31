@@ -205,6 +205,19 @@ def write_meta(
     up_class_index: int,
     feature_order: list[str],
 ) -> None:
+    def _json_default(o):
+        if isinstance(o, np.integer):
+            return int(o)
+        if isinstance(o, np.floating):
+            return float(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        if isinstance(o, Path):
+            return str(o)
+        if isinstance(o, (set, tuple)):
+            return list(o)
+        return str(o)
+
     meta = {
         "modelVersion": model_version,
         "symbol": symbol,
@@ -230,7 +243,10 @@ def write_meta(
         },
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False, default=_json_default),
+        encoding="utf-8",
+    )
 
 
 def write_current(model_dir: Path, out_dir: Path, symbol: str) -> None:
