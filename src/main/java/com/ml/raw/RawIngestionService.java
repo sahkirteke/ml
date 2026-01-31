@@ -178,6 +178,7 @@ public class RawIngestionService implements ApplicationRunner {
             double pUp = pUpOpt.get();
             double minConfidence = resolveMinConfidence(modelMeta);
             double minAbsExpectedPct = resolveMinAbsExpectedPct(modelMeta);
+            double minAbsEdge = resolveMinAbsEdge(modelMeta);
             PredRecord predRecord = new PredRecord();
             predRecord.setType("PRED");
             predRecord.setSymbol(symbol);
@@ -191,34 +192,65 @@ public class RawIngestionService implements ApplicationRunner {
             predRecord.setLoggedAt(formatMs(predRecord.getLoggedAtMs()));
             double conf = Math.max(pUp, 1.0d - pUp);
             predRecord.setConfidence(conf);
+            double edgeAbs = Math.abs(pUp - 0.5d);
+            predRecord.setEdgeAbs(edgeAbs);
             Double expectedPct = null;
+            Double expectedBp = null;
             Double meanRetUp = modelMeta.getMeanRetUp();
             Double meanRetDown = modelMeta.getMeanRetDown();
             if (meanRetUp != null && meanRetDown != null) {
                 double expectedRet = pUp * meanRetUp + (1.0d - pUp) * meanRetDown;
-                expectedPct = expectedRet * 100.0d;
+                expectedPct = expectedRet;
                 predRecord.setExpectedPct(expectedPct);
+                expectedBp = expectedPct * 10000.0d;
+                predRecord.setExpectedBp(expectedBp);
             }
+            predRecord.setMinConfidence(minConfidence);
+            predRecord.setMinAbsExpectedPct(minAbsExpectedPct);
+            predRecord.setMinAbsEdge(minAbsEdge);
+            boolean lowExpected = expectedPct != null && Math.abs(expectedPct) < minAbsExpectedPct;
+            boolean lowEdge = edgeAbs < minAbsEdge;
             String decisionReason = "DIRECT";
+            String failedGate = "NONE";
             String decision;
             if (conf < minConfidence) {
                 decision = "NO_TRADE";
                 decisionReason = "LOW_CONF";
-            } else if (expectedPct != null && Math.abs(expectedPct) < minAbsExpectedPct) {
+                failedGate = "CONFIDENCE";
+            } else if (lowExpected || lowEdge) {
                 decision = "NO_TRADE";
-                decisionReason = "LOW_EDGE";
+                if (lowExpected && lowEdge) {
+                    decisionReason = "LOW_EXPECTED|LOW_EDGE";
+                    failedGate = "EXPECTED+EDGE";
+                } else if (lowExpected) {
+                    decisionReason = "LOW_EXPECTED";
+                    failedGate = "EXPECTED";
+                } else {
+                    decisionReason = "LOW_EDGE";
+                    failedGate = "EDGE";
+                }
             } else {
                 decision = pUp >= 0.5d ? "UP" : "DOWN";
             }
             predRecord.setDecision(decision);
             predRecord.setDecisionReason(decisionReason);
+            predRecord.setFailedGate(failedGate);
             predWriter.append(predRecord);
-            log.info("PRED symbol={} closeTimeMs={} pUp={} conf={} expectedPct={} decision={} reason={} modelVersion={}",
+            log.info(
+                    "PRED symbol={} closeTimeMs={} pUp={} conf={} edgeAbs={} expectedPct={} expectedBp={} "
+                            + "minConfidence={} minAbsExpectedPct={} minAbsEdge={} failedGate={} decision={} "
+                            + "reason={} modelVersion={}",
                     symbol,
                     featureRecord.getCloseTimeMs(),
                     pUp,
                     conf,
+                    edgeAbs,
                     expectedPct,
+                    expectedBp,
+                    minConfidence,
+                    minAbsExpectedPct,
+                    minAbsEdge,
+                    failedGate,
                     predRecord.getDecision(),
                     decisionReason,
                     modelMeta.getModelVersion());
@@ -424,10 +456,20 @@ public class RawIngestionService implements ApplicationRunner {
 
     private double resolveMinAbsExpectedPct(ModelMeta meta) {
         double fallback = properties.getDecision() == null || properties.getDecision().getMinAbsExpectedPct() == null
-                ? 0.05d
+                ? 0.002d
                 : properties.getDecision().getMinAbsExpectedPct();
         if (meta.getDecisionPolicy() != null && meta.getDecisionPolicy().getMinAbsExpectedPct() != null) {
             return meta.getDecisionPolicy().getMinAbsExpectedPct();
+        }
+        return fallback;
+    }
+
+    private double resolveMinAbsEdge(ModelMeta meta) {
+        double fallback = properties.getDecision() == null || properties.getDecision().getMinAbsEdge() == null
+                ? 0.05d
+                : properties.getDecision().getMinAbsEdge();
+        if (meta.getDecisionPolicy() != null && meta.getDecisionPolicy().getMinAbsEdge() != null) {
+            return meta.getDecisionPolicy().getMinAbsEdge();
         }
         return fallback;
     }

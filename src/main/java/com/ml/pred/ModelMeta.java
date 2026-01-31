@@ -152,6 +152,7 @@ public class ModelMeta {
     public static class DecisionPolicy {
         private Double minConfidence;
         private Double minAbsExpectedPct;
+        private Double minAbsEdge;
         private String mode;
 
         public Double getMinConfidence() {
@@ -168,6 +169,14 @@ public class ModelMeta {
 
         public void setMinAbsExpectedPct(Double minAbsExpectedPct) {
             this.minAbsExpectedPct = minAbsExpectedPct;
+        }
+
+        public Double getMinAbsEdge() {
+            return minAbsEdge;
+        }
+
+        public void setMinAbsEdge(Double minAbsEdge) {
+            this.minAbsEdge = minAbsEdge;
         }
 
         public String getMode() {

@@ -242,7 +242,8 @@ def write_meta(
         "probOutputName": prob_output_name,
         "decisionPolicy": {
             "minConfidence": 0.55,
-            "minAbsExpectedPct": 0.05,
+            "minAbsExpectedPct": 0.002,
+            "minAbsEdge": 0.05,
             "mode": "FILTERED",
         },
     }

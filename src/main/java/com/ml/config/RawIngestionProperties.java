@@ -187,7 +187,8 @@ public class RawIngestionProperties {
 
     public static class DecisionProperties {
         private Double minConfidence = 0.55d;
-        private Double minAbsExpectedPct = 0.05d;
+        private Double minAbsExpectedPct = 0.002d;
+        private Double minAbsEdge = 0.05d;
 
         public Double getMinConfidence() {
             return minConfidence;
@@ -203,6 +204,14 @@ public class RawIngestionProperties {
 
         public void setMinAbsExpectedPct(Double minAbsExpectedPct) {
             this.minAbsExpectedPct = minAbsExpectedPct;
+        }
+
+        public Double getMinAbsEdge() {
+            return minAbsEdge;
+        }
+
+        public void setMinAbsEdge(Double minAbsEdge) {
+            this.minAbsEdge = minAbsEdge;
         }
     }
 }
