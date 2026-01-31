@@ -2,7 +2,6 @@
 import argparse
 import json
 import re
-import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -186,11 +185,20 @@ def write_meta(output_path: Path, model_version: str, train_days: int, train_row
     output_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
-def copy_current(model_dir: Path, out_dir: Path) -> None:
+def write_current(model_dir: Path, out_dir: Path) -> None:
     current_dir = out_dir / "current"
     current_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(model_dir / "model.onnx", current_dir / "model.onnx")
-    shutil.copy2(model_dir / "model_meta.json", current_dir / "model_meta.json")
+    model_src = model_dir / "model.onnx"
+    meta_src = model_dir / "model_meta.json"
+    model_tmp = current_dir / "model.onnx.tmp"
+    meta_tmp = current_dir / "model_meta.json.tmp"
+    model_dst = current_dir / "model.onnx"
+    meta_dst = current_dir / "model_meta.json"
+    model_tmp.write_bytes(model_src.read_bytes())
+    meta_tmp.write_bytes(meta_src.read_bytes())
+    model_tmp.replace(model_dst)
+    meta_tmp.replace(meta_dst)
+    print(f"WROTE_CURRENT_MODEL dir={current_dir} model={model_dst} meta={meta_dst}")
 
 
 def main() -> None:
@@ -211,7 +219,7 @@ def main() -> None:
     export_onnx(model, x.shape[1], model_dir / "model.onnx")
     train_days = len(extract_dates(feature_files))
     write_meta(model_dir / "model_meta.json", model_version, train_days, len(x))
-    copy_current(model_dir, args.out_dir)
+    write_current(model_dir, args.out_dir)
     total_features_rows = len(features)
     total_labels_rows = len(labels)
     unique_days = len(extract_dates(feature_files))

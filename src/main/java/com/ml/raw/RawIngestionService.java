@@ -180,6 +180,14 @@ public class RawIngestionService implements ApplicationRunner {
             predRecord.setDecision(pUp >= 0.5d ? "UP" : "DOWN");
             predRecord.setLoggedAtMs(System.currentTimeMillis());
             predWriter.append(predRecord);
+            double conf = Math.max(pUp, 1.0d - pUp);
+            log.info("PRED symbol={} closeTimeMs={} pUp={} conf={} decision={} modelVersion={}",
+                    symbol,
+                    featureRecord.getCloseTimeMs(),
+                    pUp,
+                    conf,
+                    predRecord.getDecision(),
+                    meta.get().getModelVersion());
             symbolState.updatePredIfNewer(symbol, featureRecord.getCloseTimeMs());
         } catch (Exception ex) {
             log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs(), ex);

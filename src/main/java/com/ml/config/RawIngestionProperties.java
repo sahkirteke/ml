@@ -39,7 +39,7 @@ public class RawIngestionProperties {
     private Path trainDir = Path.of("data", "train");
 
     @NotNull
-    private Path modelDir = Path.of("models", "current");
+    private Path modelDir = Path.of(System.getProperty("user.dir"), "models", "current");
 
     @NotNull
     private Long expectedGapMs = 300_000L;
