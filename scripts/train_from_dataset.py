@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -11,8 +12,12 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 
@@ -131,7 +136,7 @@ def load_features_labels(
 
 def build_training_frame(
     features: pd.DataFrame, labels: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, list[str]]:
     features_filtered = features[(features["windowReady"] == True) & (features["featuresVersion"] == FEATURES_VERSION)]
     labels_filtered = labels[labels["labelType"] == LABEL_TYPE]
     merged = features_filtered.merge(
@@ -150,19 +155,24 @@ def build_training_frame(
     x.replace([np.inf, -np.inf], np.nan, inplace=True)
     x = x.astype(np.float32)
     y = merged["labelUp"].astype(int)
-    return x, y, merged
+    stds = x.std(axis=0, skipna=True)
+    keep_cols = [col for col in x.columns if stds[col] > 0]
+    if keep_cols and len(keep_cols) != len(x.columns):
+        x = x[keep_cols].copy()
+    return x, y, merged, list(x.columns)
 
 
-def train_model(x: pd.DataFrame, y: pd.Series) -> HistGradientBoostingClassifier:
-    model = HistGradientBoostingClassifier(
-        max_iter=200,
-        max_depth=8,
-        learning_rate=0.05,
-        early_stopping=False,
-        random_state=42,
-    )
-    model.fit(x, y)
-    return model
+def build_pipeline(solver: str) -> Pipeline:
+    scaler = StandardScaler()
+    base_steps = [
+        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+        ("scaler", scaler),
+    ]
+    if solver == "saga":
+        lr = LogisticRegression(solver="saga", max_iter=4000, tol=1e-4, n_jobs=-1)
+    else:
+        lr = LogisticRegression(solver="lbfgs", max_iter=4000, tol=1e-4)
+    return Pipeline(base_steps + [("classifier", lr)])
 
 
 def export_onnx(model, feature_count: int, output_path: Path) -> tuple[list[str], list[str]]:
@@ -193,12 +203,13 @@ def write_meta(
     up_rate: float,
     classes: list[int],
     up_class_index: int,
+    feature_order: list[str],
 ) -> None:
     meta = {
         "modelVersion": model_version,
         "symbol": symbol,
         "featuresVersion": FEATURES_VERSION,
-        "featureOrder": FEATURE_ORDER,
+        "featureOrder": feature_order,
         "imputeStrategy": "zero",
         "rows": train_rows,
         "days": train_days,
@@ -255,7 +266,7 @@ def main() -> None:
         if features.empty or labels.empty:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
             continue
-        x, y, merged = build_training_frame(features, labels)
+        x, y, merged, feature_order = build_training_frame(features, labels)
         if len(x) < args.min_rows_per_symbol:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} min={args.min_rows_per_symbol}")
             continue
@@ -271,14 +282,31 @@ def main() -> None:
         n_down = int(down_mask.sum())
         total_labels = n_up + n_down
         up_rate = float(n_up / total_labels) if total_labels > 0 else 0.0
-        model = train_model(x, y)
+        base_pipeline = build_pipeline("lbfgs")
+        print(
+            "MODEL_CONFIG symbol={} solver=lbfgs max_iter=4000 scaler=StandardScaler".format(symbol)
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ConvergenceWarning)
+            base_pipeline.fit(x, y)
+        has_convergence_warning = any(
+            isinstance(warning.message, ConvergenceWarning) for warning in caught
+        )
+        if has_convergence_warning:
+            print("WARN_CONVERGENCE symbol={} solver=lbfgs fallback_solver=saga".format(symbol))
+            base_pipeline = build_pipeline("saga")
+            print(
+                "MODEL_CONFIG symbol={} solver=saga max_iter=4000 scaler=StandardScaler".format(symbol)
+            )
+            base_pipeline.fit(x, y)
         calibrated = None
         if args.calibrate:
             tscv = TimeSeriesSplit(n_splits=3)
-            calibrated = CalibratedClassifierCV(estimator=model, method="sigmoid", cv=tscv)
+            calibrated = CalibratedClassifierCV(estimator=base_pipeline, method="sigmoid", cv=tscv)
             calibrated.fit(x, y)
-        model_for_stats = calibrated if calibrated is not None else model
-        classes = list(getattr(model_for_stats, "classes_", []))
+        model_for_stats = calibrated if calibrated is not None else base_pipeline
+        classifier = base_pipeline.named_steps["classifier"]
+        classes = list(getattr(classifier, "classes_", []))
         if not classes:
             raise RuntimeError(f"No classes_ found for symbol {symbol}")
         if 1 not in classes:
@@ -296,16 +324,16 @@ def main() -> None:
             )
         model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
         model_dir = args.out_dir / symbol / model_version
-        export_model = calibrated if calibrated is not None else model
+        export_model = calibrated if calibrated is not None else base_pipeline
         try:
             input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
             print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
         except Exception as exc:
             print(f"ONNX_EXPORT_FAILED symbol={symbol} calibrated failed ({exc}); fallback: export non-calibrated.")
-            export_model = model
+            export_model = base_pipeline
             input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
             print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
-        if export_model is model:
+        if export_model is base_pipeline:
             onnx_checked = False
         else:
             onnx_checked = True
@@ -347,6 +375,7 @@ def main() -> None:
             up_rate,
             classes,
             up_class_index,
+            feature_order,
         )
         write_current(model_dir, args.out_dir, symbol)
         wrote_path = args.out_dir / symbol / "current"
