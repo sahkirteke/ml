@@ -1,1 +1,10 @@
-spring.application.name:ml
+spring.application.name: ml
+
+raw:
+  symbols:
+    - MANAUSDT
+    - XRPUSDT
+  tf: 5m
+  data-dir: data
+  partition-zone: UTC
+  eps: 1e-12
