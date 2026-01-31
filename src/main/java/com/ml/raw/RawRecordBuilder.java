@@ -58,8 +58,9 @@ public class RawRecordBuilder {
             if (sellBase.signum() < 0) {
                 sellBase = BigDecimal.ZERO;
             }
-            BigDecimal denom = sellBase.compareTo(eps) < 0 ? eps : sellBase;
-            BigDecimal ratio = takerBuy.divide(denom, 18, RoundingMode.HALF_UP);
+            BigDecimal ratio = sellBase.compareTo(BigDecimal.ZERO) == 0
+                    ? BigDecimal.ZERO
+                    : takerBuy.divide(sellBase, 18, RoundingMode.HALF_UP);
             BigDecimal delta = takerBuy.subtract(sellBase);
             record.setSellBaseVol(sellBase.toPlainString());
             record.setBuySellRatio(ratio.toPlainString());

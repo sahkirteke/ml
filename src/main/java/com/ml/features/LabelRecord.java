@@ -6,24 +6,20 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 @JsonInclude(JsonInclude.Include.NON_NULL)
 @JsonPropertyOrder({
         "symbol",
+        "tf",
         "closeTimeMs",
-        "futureCloseTimeMs",
+        "labelType",
         "futureRet_1",
-        "labelUp",
-        "labelValid",
-        "gapMs",
-        "expectedGapMs"
+        "labelUp"
 })
 public class LabelRecord {
 
     private String symbol;
+    private String tf;
     private long closeTimeMs;
-    private long futureCloseTimeMs;
+    private String labelType;
     private double futureRet_1;
-    private boolean labelUp;
-    private boolean labelValid;
-    private long gapMs;
-    private long expectedGapMs;
+    private int labelUp;
 
     public String getSymbol() {
         return symbol;
@@ -31,6 +27,14 @@ public class LabelRecord {
 
     public void setSymbol(String symbol) {
         this.symbol = symbol;
+    }
+
+    public String getTf() {
+        return tf;
+    }
+
+    public void setTf(String tf) {
+        this.tf = tf;
     }
 
     public long getCloseTimeMs() {
@@ -41,12 +45,12 @@ public class LabelRecord {
         this.closeTimeMs = closeTimeMs;
     }
 
-    public long getFutureCloseTimeMs() {
-        return futureCloseTimeMs;
+    public String getLabelType() {
+        return labelType;
     }
 
-    public void setFutureCloseTimeMs(long futureCloseTimeMs) {
-        this.futureCloseTimeMs = futureCloseTimeMs;
+    public void setLabelType(String labelType) {
+        this.labelType = labelType;
     }
 
     public double getFutureRet_1() {
@@ -57,35 +61,11 @@ public class LabelRecord {
         this.futureRet_1 = futureRet_1;
     }
 
-    public boolean isLabelUp() {
+    public int getLabelUp() {
         return labelUp;
     }
 
-    public void setLabelUp(boolean labelUp) {
+    public void setLabelUp(int labelUp) {
         this.labelUp = labelUp;
-    }
-
-    public boolean isLabelValid() {
-        return labelValid;
-    }
-
-    public void setLabelValid(boolean labelValid) {
-        this.labelValid = labelValid;
-    }
-
-    public long getGapMs() {
-        return gapMs;
-    }
-
-    public void setGapMs(long gapMs) {
-        this.gapMs = gapMs;
-    }
-
-    public long getExpectedGapMs() {
-        return expectedGapMs;
-    }
-
-    public void setExpectedGapMs(long expectedGapMs) {
-        this.expectedGapMs = expectedGapMs;
     }
 }

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 @JsonInclude(JsonInclude.Include.NON_NULL)
 @JsonPropertyOrder({
         "symbol",
+        "tf",
         "closeTimeMs",
         "closePrice",
         "featuresVersion",
@@ -32,6 +33,7 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 public class FeatureRecord {
 
     private String symbol;
+    private String tf;
     private long closeTimeMs;
     private String closePrice;
     private String featuresVersion;
@@ -62,6 +64,14 @@ public class FeatureRecord {
 
     public void setSymbol(String symbol) {
         this.symbol = symbol;
+    }
+
+    public String getTf() {
+        return tf;
+    }
+
+    public void setTf(String tf) {
+        this.tf = tf;
     }
 
     public long getCloseTimeMs() {

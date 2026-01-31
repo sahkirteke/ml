@@ -27,11 +27,11 @@ public class LabelWriter {
         try {
             Path file = appender.appendLabel(record);
             String partition = partitionResolver.resolveDate(record.getCloseTimeMs());
-            log.debug("LABEL_WRITE symbol={} closeTimeMs={} partition={} labelValid={}",
+            log.debug("LABEL_WRITE symbol={} closeTimeMs={} partition={} labelUp={}",
                     record.getSymbol(),
                     record.getCloseTimeMs(),
                     partition,
-                    record.isLabelValid());
+                    record.getLabelUp());
             return file;
         } catch (Exception ex) {
             throw new RuntimeException(ex);

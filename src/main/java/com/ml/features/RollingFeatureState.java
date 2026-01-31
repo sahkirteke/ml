@@ -39,6 +39,7 @@ public class RollingFeatureState {
                 parseDouble(record.getHighPrice()),
                 parseDouble(record.getLowPrice()),
                 parseDouble(record.getClosePrice()),
+                record.getClosePrice(),
                 parseDouble(record.getVolume()),
                 record.getTradeCount(),
                 parseDouble(record.getBuySellRatio()),
@@ -83,6 +84,7 @@ public class RollingFeatureState {
         private final double high;
         private final double low;
         private final double close;
+        private final String closePrice;
         private final double volume;
         private final long tradeCount;
         private final double buySellRatio;
@@ -95,6 +97,7 @@ public class RollingFeatureState {
                    double high,
                    double low,
                    double close,
+                   String closePrice,
                    double volume,
                    long tradeCount,
                    double buySellRatio,
@@ -106,6 +109,7 @@ public class RollingFeatureState {
             this.high = high;
             this.low = low;
             this.close = close;
+            this.closePrice = closePrice;
             this.volume = volume;
             this.tradeCount = tradeCount;
             this.buySellRatio = buySellRatio;
@@ -138,6 +142,10 @@ public class RollingFeatureState {
 
         public double getClose() {
             return close;
+        }
+
+        public String getClosePrice() {
+            return closePrice;
         }
 
         public double getVolume() {

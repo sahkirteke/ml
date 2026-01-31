@@ -22,8 +22,9 @@ public class FeatureCalculator {
         List<Bar> bars = state.getBars();
         FeatureRecord record = new FeatureRecord();
         record.setSymbol(state.getSymbol());
+        record.setTf(properties.getTf());
         record.setCloseTimeMs(current.getCloseTimeMs());
-        record.setClosePrice(Double.toString(current.getClose()));
+        record.setClosePrice(current.getClosePrice());
         record.setFeaturesVersion(properties.getFeaturesVersion());
 
         Double ret1 = computeReturn(bars, 1);

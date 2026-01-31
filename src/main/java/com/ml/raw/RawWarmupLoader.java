@@ -72,7 +72,8 @@ public class RawWarmupLoader {
         RollingFeatureState state = stateRegistry.getOrCreate(symbol);
         for (RawRecord record : records) {
             state.add(record);
-            symbolState.updateIfNewer(symbol, record.getCloseTimeMs());
+            symbolState.updateRawIfNewer(symbol, record.getCloseTimeMs());
+            symbolState.setPrevClose(symbol, record.getCloseTimeMs(), parseClose(record));
         }
         long firstClose = records.isEmpty() ? -1L : records.get(0).getCloseTimeMs();
         long lastClose = records.isEmpty() ? -1L : records.get(records.size() - 1).getCloseTimeMs();
@@ -115,5 +116,16 @@ public class RawWarmupLoader {
             log.warn("WARMUP_READ_FAIL file={}", file, ex);
         }
         return records;
+    }
+
+    private double parseClose(RawRecord record) {
+        if (record == null || record.getClosePrice() == null || record.getClosePrice().isBlank()) {
+            return 0.0d;
+        }
+        try {
+            return Double.parseDouble(record.getClosePrice());
+        } catch (NumberFormatException ex) {
+            return 0.0d;
+        }
     }
 }

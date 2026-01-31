@@ -81,9 +81,9 @@ public class RawIngestionService implements ApplicationRunner {
         String symbol = resolveSymbol(envelope);
         KlinePayload kline = event.getKline();
         long closeTime = kline.getCloseTime() == null ? -1L : kline.getCloseTime();
-        if (!symbolState.updateIfNewer(symbol, closeTime)) {
-            long last = symbolState.getLastCloseTimeMs(symbol);
-            log.info("RAW_SKIP_DUP symbol={} closeTimeMs={} last={}", symbol, closeTime, last);
+        if (!symbolState.updateRawIfNewer(symbol, closeTime)) {
+            long last = symbolState.getLastRawWrittenCloseTimeMs(symbol);
+            log.info("SKIP_DUP symbol={} closeTimeMs={} last={}", symbol, closeTime, last);
             return Mono.empty();
         }
         long receivedAt = System.currentTimeMillis();
@@ -96,11 +96,18 @@ public class RawIngestionService implements ApplicationRunner {
                 appender.append(record);
                 RollingFeatureState state = stateRegistry.getOrCreate(symbol);
                 LabelRecord labelRecord = buildLabel(state, record);
-                if (labelRecord != null
-                        && symbolState.updateLabelsIfNewer(symbol, labelRecord.getCloseTimeMs())) {
-                    labelWriter.append(labelRecord);
+                if (labelRecord != null) {
+                    if (symbolState.updateLabelsIfNewer(symbol, labelRecord.getCloseTimeMs())) {
+                        labelWriter.append(labelRecord);
+                    } else {
+                        log.info("SKIP_DUP symbol={} closeTimeMs={} last={}",
+                                symbol,
+                                labelRecord.getCloseTimeMs(),
+                                symbolState.getLastLabelsCloseTimeMs(symbol));
+                    }
                 }
                 state.add(record);
+                symbolState.setPrevClose(symbol, record.getCloseTimeMs(), parseDouble(record.getClosePrice()));
                 FeatureRecord featureRecord = featureCalculator.calculate(state);
                 if (featureRecord != null
                         && symbolState.updateFeaturesIfNewer(symbol, featureRecord.getCloseTimeMs())) {
@@ -128,15 +135,22 @@ public class RawIngestionService implements ApplicationRunner {
         double futureRet = currentClose / prevClose - 1.0d;
         long expectedGap = properties.getExpectedGapMs() == null ? 300_000L : properties.getExpectedGapMs();
         long gapMs = current.getCloseTimeMs() - previous.getCloseTimeMs();
+        if (gapMs != expectedGap) {
+            log.info("SKIP_GAP symbol={} prevCloseTimeMs={} closeTimeMs={} gapMs={} expectedGapMs={}",
+                    current.getSymbol(),
+                    previous.getCloseTimeMs(),
+                    current.getCloseTimeMs(),
+                    gapMs,
+                    expectedGap);
+            return null;
+        }
         LabelRecord label = new LabelRecord();
         label.setSymbol(current.getSymbol());
+        label.setTf(current.getTf());
         label.setCloseTimeMs(previous.getCloseTimeMs());
-        label.setFutureCloseTimeMs(current.getCloseTimeMs());
+        label.setLabelType("next_close_direction");
         label.setFutureRet_1(futureRet);
-        label.setLabelUp(futureRet > 0.0d);
-        label.setExpectedGapMs(expectedGap);
-        label.setGapMs(gapMs);
-        label.setLabelValid(gapMs == expectedGap);
+        label.setLabelUp(futureRet > 0.0d ? 1 : 0);
         return label;
     }
 
