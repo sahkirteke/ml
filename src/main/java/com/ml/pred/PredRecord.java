@@ -10,6 +10,10 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
         "tf",
         "closeTimeMs",
         "closeTime",
+        "direction",
+        "entryPrice",
+        "tpPrice",
+        "slPrice",
         "featuresVersion",
         "modelVersion",
         "pUp",
@@ -20,7 +24,6 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
         "minConfidence",
         "minAbsExpectedPct",
         "minAbsEdge",
-        "decision",
         "decisionReason",
         "failedGate",
         "loggedAtMs",
@@ -33,6 +36,10 @@ public class PredRecord {
     private String tf;
     private long closeTimeMs;
     private String closeTime;
+    private String direction;
+    private Double entryPrice;
+    private Double tpPrice;
+    private Double slPrice;
     private String featuresVersion;
     private String modelVersion;
     private double pUp;
@@ -43,7 +50,6 @@ public class PredRecord {
     private Double minConfidence;
     private Double minAbsExpectedPct;
     private Double minAbsEdge;
-    private String decision;
     private String decisionReason;
     private String failedGate;
     private long loggedAtMs;
@@ -87,6 +93,38 @@ public class PredRecord {
 
     public void setCloseTime(String closeTime) {
         this.closeTime = closeTime;
+    }
+
+    public String getDirection() {
+        return direction;
+    }
+
+    public void setDirection(String direction) {
+        this.direction = direction;
+    }
+
+    public Double getEntryPrice() {
+        return entryPrice;
+    }
+
+    public void setEntryPrice(Double entryPrice) {
+        this.entryPrice = entryPrice;
+    }
+
+    public Double getTpPrice() {
+        return tpPrice;
+    }
+
+    public void setTpPrice(Double tpPrice) {
+        this.tpPrice = tpPrice;
+    }
+
+    public Double getSlPrice() {
+        return slPrice;
+    }
+
+    public void setSlPrice(Double slPrice) {
+        this.slPrice = slPrice;
     }
 
     public String getFeaturesVersion() {
@@ -167,14 +205,6 @@ public class PredRecord {
 
     public void setMinAbsEdge(Double minAbsEdge) {
         this.minAbsEdge = minAbsEdge;
-    }
-
-    public String getDecision() {
-        return decision;
-    }
-
-    public void setDecision(String decision) {
-        this.decision = decision;
     }
 
     public String getDecisionReason() {
