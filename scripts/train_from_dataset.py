@@ -16,7 +16,6 @@ import pandas as pd
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from skl2onnx import convert_sklearn
@@ -50,6 +49,7 @@ TP_PCT = 0.004
 SL_PCT = 0.002
 GAP_MS = 300000
 CONF_THRESHOLD = 0.55
+P_TRADE = 0.55
 TRAIN_LIMIT = 400000
 
 
@@ -124,6 +124,10 @@ def resolve_istanbul_tz():
                 "ZoneInfo is required for --exclude-today; install backports.zoneinfo for Python < 3.9."
             ) from exc
     return ZoneInfo("Europe/Istanbul")
+
+
+def format_ms(epoch_ms: int) -> str:
+    return datetime.utcfromtimestamp(epoch_ms / 1000.0).isoformat() + "Z"
 
 
 def load_feature_frames(
@@ -375,6 +379,187 @@ def build_training_frames(
     return (x_long, y_long, close_long), (x_short, y_short, close_short), feature_order
 
 
+def simulate_trade_only(
+    symbol: str,
+    raw_df: pd.DataFrame,
+    feat_df: pd.DataFrame,
+    model_long,
+    model_short,
+    out_pred_path: Path,
+    *,
+    conf_thr: float = CONF_THRESHOLD,
+    p_trade: float = P_TRADE,
+    horizon_bars: int = MAX_HORIZON_BARS,
+) -> dict:
+    raw_sorted = raw_df.sort_values("closeTimeMs").copy()
+    feat_sorted = feat_df.sort_values("closeTimeMs").copy()
+    raw_sorted["close"] = pd.to_numeric(raw_sorted["closePrice"], errors="coerce")
+    raw_sorted["high"] = pd.to_numeric(raw_sorted["highPrice"], errors="coerce")
+    raw_sorted["low"] = pd.to_numeric(raw_sorted["lowPrice"], errors="coerce")
+    joined = feat_sorted.merge(
+        raw_sorted[["closeTimeMs", "close", "high", "low"]],
+        on="closeTimeMs",
+        how="inner",
+    )
+    joined = joined[joined["windowReady"] == True].copy()
+    if joined.empty:
+        return {
+            "predCount": 0,
+            "evalCount": 0,
+            "okCount": 0,
+            "nokCount": 0,
+            "winrate": 0.0,
+            "avgBarsToEvent": 0.0,
+            "daysSpan": 0,
+            "predsPerDay": 0.0,
+        }
+    feature_cols = [col for col in FEATURE_ORDER if col in joined.columns]
+    x_vals = joined[feature_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
+    prob_long = model_long.predict_proba(x_vals) if model_long is not None else None
+    prob_short = model_short.predict_proba(x_vals) if model_short is not None else None
+    if prob_long is None and prob_short is None:
+        raise RuntimeError("At least one model is required for simulation.")
+    pred_count = 0
+    eval_count = 0
+    ok_count = 0
+    nok_count = 0
+    bars_to_event: list[int] = []
+    pending: dict[str, object] | None = None
+    out_pred_path.parent.mkdir(parents=True, exist_ok=True)
+    prev_close_time = None
+    with out_pred_path.open("w", encoding="utf-8") as handle:
+        for idx, row in joined.iterrows():
+            close_time = int(row["closeTimeMs"])
+            if prev_close_time is not None and close_time - prev_close_time != GAP_MS:
+                pending = None
+                prev_close_time = close_time
+                continue
+            prev_close_time = close_time
+            high = float(row["high"])
+            low = float(row["low"])
+            close = float(row["close"])
+            if pending is not None:
+                hit_tp = False
+                hit_sl = False
+                if pending["direction"] == "UP":
+                    hit_tp = high >= pending["tpPrice"]
+                    hit_sl = low <= pending["slPrice"]
+                else:
+                    hit_tp = low <= pending["tpPrice"]
+                    hit_sl = high >= pending["slPrice"]
+                if hit_tp or hit_sl:
+                    event = "TP_HIT"
+                    result = "OK"
+                    if hit_sl:
+                        event = "SL_HIT"
+                        result = "NOK"
+                    if hit_tp and hit_sl:
+                        event = "SL_HIT_SAME_BAR"
+                        result = "NOK"
+                    eval_record = {
+                        "type": "EVAL",
+                        "symbol": symbol,
+                        "tf": row.get("tf"),
+                        "predCloseTimeMs": pending["predCloseTimeMs"],
+                        "eventCloseTimeMs": close_time,
+                        "direction": pending["direction"],
+                        "result": result,
+                        "event": event,
+                        "entryPrice": pending["entry"],
+                        "tpPrice": pending["tpPrice"],
+                        "slPrice": pending["slPrice"],
+                    }
+                    handle.write(json.dumps(eval_record, ensure_ascii=False) + "\n")
+                    eval_count += 1
+                    if result == "OK":
+                        ok_count += 1
+                    else:
+                        nok_count += 1
+                    bars_to_event.append(horizon_bars - pending["barsLeft"] + 1)
+                    pending = None
+                    continue
+                pending["barsLeft"] -= 1
+                if pending["barsLeft"] <= 0:
+                    pending = None
+                continue
+            row_index = joined.index.get_loc(idx)
+            if prob_long is not None:
+                p_long_hit = float(prob_long[row_index][1])
+            else:
+                p_long_hit = 0.0
+            if prob_short is not None:
+                p_short_hit = float(prob_short[row_index][1])
+            else:
+                p_short_hit = 0.0
+            if model_short is None:
+                p_hit = p_long_hit
+                direction = "UP" if p_hit >= 0.5 else "DOWN"
+            else:
+                p_hit = max(p_long_hit, p_short_hit)
+                direction = "UP" if p_long_hit >= p_short_hit else "DOWN"
+            if p_hit < p_trade:
+                continue
+            tp_price = close * (1.0 + TP_PCT) if direction == "UP" else close * (1.0 - TP_PCT)
+            sl_price = close * (1.0 - SL_PCT) if direction == "UP" else close * (1.0 + SL_PCT)
+            pred_record = {
+                "type": "PRED",
+                "symbol": symbol,
+                "tf": row.get("tf"),
+                "closeTimeMs": close_time,
+                "closeTime": format_ms(close_time),
+                "horizonBars": horizon_bars,
+                "tpPct": TP_PCT,
+                "slPct": SL_PCT,
+                "direction": direction,
+                "entryPrice": close,
+                "tpPrice": tp_price,
+                "slPrice": sl_price,
+                "pHit": p_hit,
+                "pTrade": p_trade,
+                "confidence": max(p_hit, 1.0 - p_hit),
+            }
+            handle.write(json.dumps(pred_record, ensure_ascii=False) + "\n")
+            pred_count += 1
+            pending = {
+                "predCloseTimeMs": close_time,
+                "entry": close,
+                "direction": direction,
+                "tpPrice": tp_price,
+                "slPrice": sl_price,
+                "barsLeft": horizon_bars,
+            }
+    days_span = 0
+    if not raw_sorted.empty:
+        start_ms = int(raw_sorted["closeTimeMs"].min())
+        end_ms = int(raw_sorted["closeTimeMs"].max())
+        days_span = int(math.ceil((end_ms - start_ms + 1) / 86_400_000))
+    total_events = ok_count + nok_count
+    winrate = ok_count / total_events if total_events else 0.0
+    avg_bars = float(np.mean(bars_to_event)) if bars_to_event else 0.0
+    preds_per_day = pred_count / max(days_span, 1)
+    summary = {
+        "predCount": pred_count,
+        "evalCount": eval_count,
+        "okCount": ok_count,
+        "nokCount": nok_count,
+        "winrate": winrate,
+        "avgBarsToEvent": avg_bars,
+        "daysSpan": days_span,
+        "predsPerDay": preds_per_day,
+    }
+    print(
+        "SIM_SUMMARY symbol={} preds={} evals={} ok={} nok={} winrate={:.6f}".format(
+            symbol,
+            pred_count,
+            eval_count,
+            ok_count,
+            nok_count,
+            winrate,
+        )
+    )
+    return summary
+
+
 def build_lr_pipeline(
     solver: str,
     *,
@@ -544,25 +729,6 @@ def check_onnx_outputs(symbol: str, model_path: Path, x_check: np.ndarray) -> No
         print(f"WARN_ONNX_MISMATCH symbol={symbol} error={exc}")
 
 
-def compute_confidence_metrics(
-    y_true: pd.Series,
-    preds: np.ndarray,
-    p_hit: np.ndarray,
-    *,
-    conf_threshold: float,
-    days_span: int,
-) -> tuple[float, float, int, float]:
-    confidence = np.maximum(p_hit, 1.0 - p_hit)
-    trade_mask = confidence >= conf_threshold
-    orders = int(np.sum(trade_mask))
-    coverage = float(orders / len(confidence)) if len(confidence) else 0.0
-    orders_per_day = float(orders / max(days_span, 1))
-    if not np.any(trade_mask):
-        return float("nan"), coverage, orders, orders_per_day
-    acc_hi = float(accuracy_score(y_true[trade_mask], preds[trade_mask]))
-    return acc_hi, coverage, orders, orders_per_day
-
-
 def main() -> None:
     args = parse_args()
     if args.symbols:
@@ -585,6 +751,10 @@ def main() -> None:
         if features.empty:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
             continue
+        features_filtered = features[(features["windowReady"] == True) & (features["featuresVersion"] == FEATURES_VERSION)]
+        if features_filtered.empty:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
         raw, _ = load_raw_frames(
             args.data_dir,
             symbol,
@@ -592,256 +762,260 @@ def main() -> None:
             fast_tail=args.fast_tail,
             need_rows=need_rows,
         )
-        (long_data, short_data, feature_order) = build_training_frames(features, raw)
-        side_configs = [
-            ("long", long_data, "tp0_004_sl0_002_within_7_event_driven_LONG"),
-            ("short", short_data, "tp0_004_sl0_002_within_7_event_driven_SHORT"),
+        if args.test_rows <= 0 or args.val_rows <= 0:
+            raise RuntimeError("--test-rows and --val-rows must be > 0")
+        close_times = features_filtered["closeTimeMs"].sort_values().to_numpy()
+        if len(close_times) <= args.test_rows + args.val_rows:
+            print(
+                "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
+                    symbol, len(close_times), args.min_rows_per_symbol
+                )
+            )
+            continue
+        test_start_idx = len(close_times) - args.test_rows
+        val_start_idx = test_start_idx - args.val_rows
+        val_start_ms = close_times[val_start_idx]
+        test_start_ms = close_times[test_start_idx]
+        train_end_ms = val_start_ms
+        val_end_ms = test_start_ms
+        raw_sorted = raw.sort_values("closeTimeMs")
+        train_raw = raw_sorted[raw_sorted["closeTimeMs"] < train_end_ms]
+        val_raw = raw_sorted[(raw_sorted["closeTimeMs"] >= val_start_ms) & (raw_sorted["closeTimeMs"] < val_end_ms)]
+        test_raw = raw_sorted[raw_sorted["closeTimeMs"] >= test_start_ms]
+        train_feat = features_filtered[features_filtered["closeTimeMs"] < train_end_ms]
+        val_feat = features_filtered[
+            (features_filtered["closeTimeMs"] >= val_start_ms) & (features_filtered["closeTimeMs"] < val_end_ms)
         ]
-        for side, (x, y, close_time), label_type in side_configs:
-            if len(x) < args.min_rows_per_symbol:
-                print(
-                    "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} side={} rows={} min={}".format(
-                        symbol, side, len(x), args.min_rows_per_symbol
-                    )
-                )
-                continue
-            if args.test_rows <= 0 or args.val_rows <= 0:
-                raise RuntimeError("--test-rows and --val-rows must be > 0")
-            if len(x) <= args.test_rows + args.val_rows:
-                print(
-                    "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} side={} rows={} min={}".format(
-                        symbol, side, len(x), args.min_rows_per_symbol
-                    )
-                )
-                continue
-            x = x.reset_index(drop=True)
-            y = y.reset_index(drop=True)
-            test_rows = args.test_rows
-            val_rows = args.val_rows
-            test_start = len(x) - test_rows
-            val_start = test_start - val_rows
-            x_train_pool = x.iloc[:val_start]
-            y_train_pool = y.iloc[:val_start]
-            x_val = x.iloc[val_start:test_start]
-            y_val = y.iloc[val_start:test_start]
-            x_test = x.iloc[test_start:]
-            y_test = y.iloc[test_start:]
-            val_close = close_time[val_start:test_start]
-            test_close = close_time[test_start:]
-            if len(x_train_pool) > TRAIN_LIMIT:
-                x_train_pool = x_train_pool.iloc[-TRAIN_LIMIT:]
-                y_train_pool = y_train_pool.iloc[-TRAIN_LIMIT:]
+        test_feat = features_filtered[features_filtered["closeTimeMs"] >= test_start_ms]
 
-            def compute_span(values: np.ndarray) -> int:
-                if len(values) == 0:
-                    return 0
-                start_ms = int(np.nanmin(values))
-                end_ms = int(np.nanmax(values))
-                return int(math.ceil((end_ms - start_ms + 1) / 86_400_000))
+        (long_data, short_data, feature_order) = build_training_frames(features, raw)
+        x_long, y_long, close_long = long_data
+        x_short, y_short, close_short = short_data
+        if x_long.empty or x_short.empty:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
+        train_mask_long = close_long < train_end_ms
+        val_mask_long = (close_long >= val_start_ms) & (close_long < val_end_ms)
+        test_mask_long = close_long >= test_start_ms
+        train_mask_short = close_short < train_end_ms
+        val_mask_short = (close_short >= val_start_ms) & (close_short < val_end_ms)
+        test_mask_short = close_short >= test_start_ms
+        x_long_train = x_long.loc[train_mask_long]
+        y_long_train = y_long.loc[train_mask_long]
+        x_short_train = x_short.loc[train_mask_short]
+        y_short_train = y_short.loc[train_mask_short]
+        x_long_val = x_long.loc[val_mask_long]
+        y_long_val = y_long.loc[val_mask_long]
+        x_short_val = x_short.loc[val_mask_short]
+        y_short_val = y_short.loc[val_mask_short]
+        x_long_test = x_long.loc[test_mask_long]
+        y_long_test = y_long.loc[test_mask_long]
+        x_short_test = x_short.loc[test_mask_short]
+        y_short_test = y_short.loc[test_mask_short]
+        if len(x_long_train) < args.min_rows_per_symbol or len(x_short_train) < args.min_rows_per_symbol:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
+        if len(x_long_val) == 0 or len(x_short_val) == 0 or len(x_long_test) == 0 or len(x_short_test) == 0:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
+        if len(x_long_train) > TRAIN_LIMIT:
+            x_long_train = x_long_train.iloc[-TRAIN_LIMIT:]
+            y_long_train = y_long_train.iloc[-TRAIN_LIMIT:]
+        if len(x_short_train) > TRAIN_LIMIT:
+            x_short_train = x_short_train.iloc[-TRAIN_LIMIT:]
+            y_short_train = y_short_train.iloc[-TRAIN_LIMIT:]
+        best = None
+        lr_params = list(
+            itertools.product(
+                [0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
+                [None, "balanced"],
+                ["lbfgs", "saga"],
+                [4000],
+                [1e-4, 1e-3],
+            )
+        )
+        if not args.auto_tune:
+            lr_params = [(1.0, None, "lbfgs", 4000, 1e-4)]
+        if args.max_trials:
+            lr_params = lr_params[: args.max_trials]
+        for trial_index, params_raw in enumerate(lr_params, start=1):
+            c_value, class_weight, solver, max_iter, tol = params_raw
+            params = {
+                "C": c_value,
+                "class_weight": class_weight,
+                "solver": solver,
+                "max_iter": max_iter,
+                "tol": tol,
+            }
+            model_long = build_lr_pipeline(
+                solver,
+                c_value=c_value,
+                class_weight=class_weight,
+                max_iter=max_iter,
+                tol=tol,
+            )
+            model_short = build_lr_pipeline(
+                solver,
+                c_value=c_value,
+                class_weight=class_weight,
+                max_iter=max_iter,
+                tol=tol,
+            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ConvergenceWarning)
+                model_long.fit(x_long_train, y_long_train)
+                model_short.fit(x_short_train, y_short_train)
+            has_convergence_warning = any(
+                isinstance(warning.message, ConvergenceWarning) for warning in caught
+            )
+            if has_convergence_warning:
+                print("WARN_CONVERGENCE symbol={} params={}".format(symbol, params))
+            import tempfile
 
-            val_days = compute_span(val_close)
-            test_days = compute_span(test_close)
-            pos_rate_val = float(np.mean(y_val)) if len(y_val) else 0.0
-            pos_rate_test = float(np.mean(y_test)) if len(y_test) else 0.0
-            baseline_val = max(pos_rate_val, 1.0 - pos_rate_val)
-            baseline_test = max(pos_rate_test, 1.0 - pos_rate_test)
+            with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=True) as tmp_file:
+                sim_summary = simulate_trade_only(
+                    symbol,
+                    val_raw,
+                    val_feat,
+                    model_long,
+                    model_short,
+                    Path(tmp_file.name),
+                    conf_thr=CONF_THRESHOLD,
+                    p_trade=P_TRADE,
+                    horizon_bars=MAX_HORIZON_BARS,
+                )
+            winrate = sim_summary["winrate"]
+            preds_per_day = sim_summary["predsPerDay"]
+            preds = sim_summary["predCount"]
             print(
-                "DATA_STATS symbol={} side={} trainRows={} valRows={} testRows={}".format(
-                    symbol, side, len(x_train_pool), len(x_val), len(x_test)
+                "TUNE symbol={} trial={} params={} winrate={:.6f} preds={} predsPerDay={:.6f}".format(
+                    symbol,
+                    trial_index,
+                    params,
+                    winrate,
+                    preds,
+                    preds_per_day,
                 )
             )
-            print(
-                "SPAN symbol={} side={} valDays={} testDays={}".format(
-                    symbol, side, val_days, test_days
-                )
-            )
-            print(
-                "POS_RATE symbol={} side={} valPos={:.6f} testPos={:.6f}".format(
-                    symbol, side, pos_rate_val, pos_rate_test
-                )
-            )
-            print(
-                "BASELINE symbol={} side={} valBaseline={:.6f} testBaseline={:.6f}".format(
-                    symbol, side, baseline_val, baseline_test
-                )
-            )
-            conf_threshold = args.conf_threshold
-            best = None
-            lr_params = list(
-                itertools.product(
-                    [0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
-                    [None, "balanced"],
-                    ["lbfgs", "saga"],
-                    [4000],
-                    [1e-4, 1e-3],
-                )
-            )
-            if not args.auto_tune:
-                lr_params = [(1.0, None, "lbfgs", 4000, 1e-4)]
-            if args.max_trials:
-                lr_params = lr_params[: args.max_trials]
-            for trial_index, params_raw in enumerate(lr_params, start=1):
-                c_value, class_weight, solver, max_iter, tol = params_raw
-                params = {
-                    "C": c_value,
-                    "class_weight": class_weight,
-                    "solver": solver,
-                    "max_iter": max_iter,
-                    "tol": tol,
-                }
-                model = build_lr_pipeline(
-                    solver,
-                    c_value=c_value,
-                    class_weight=class_weight,
-                    max_iter=max_iter,
-                    tol=tol,
-                )
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always", ConvergenceWarning)
-                    model.fit(x_train_pool, y_train_pool)
-                has_convergence_warning = any(
-                    isinstance(warning.message, ConvergenceWarning) for warning in caught
-                )
-                if has_convergence_warning:
-                    print("WARN_CONVERGENCE symbol={} side={} params={}".format(symbol, side, params))
-                val_proba = model.predict_proba(x_val)
-                classes = list(getattr(model, "classes_", []))
-                if not classes and isinstance(model, Pipeline):
-                    classes = list(model.named_steps["classifier"].classes_)
-                if 1 not in classes:
-                    raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
-                pos_index = classes.index(1)
-                p_hit = val_proba[:, pos_index]
-                val_preds = model.predict(x_val)
-                acc_hi, coverage, val_orders, val_orders_per_day = compute_confidence_metrics(
-                    y_val,
-                    val_preds,
-                    p_hit,
-                    conf_threshold=conf_threshold,
-                    days_span=val_days,
-                )
-                print(
-                    "TUNE symbol={} side={} trial={} params={} accHi={} coverage={:.6f} "
-                    "valOrders={} valOrdersPerDay={:.6f}".format(
-                        symbol,
-                        side,
-                        trial_index,
-                        params,
-                        "nan" if np.isnan(acc_hi) else f"{acc_hi:.6f}",
-                        coverage,
-                        val_orders,
-                        val_orders_per_day,
-                    )
-                )
-                score_acc_hi = -1.0 if np.isnan(acc_hi) else acc_hi
-                metric = (score_acc_hi, val_orders_per_day)
-                candidate = {
+            score_win = winrate
+            metric = (score_win, preds_per_day)
+            if best is None or metric > best["metric"]:
+                best = {
                     "metric": metric,
                     "params": params,
-                    "acc_hi": acc_hi,
-                    "coverage": coverage,
-                    "val_orders": val_orders,
-                    "val_orders_per_day": val_orders_per_day,
+                    "winrate": winrate,
+                    "preds": preds,
+                    "preds_per_day": preds_per_day,
                 }
-                if best is None or metric > best["metric"]:
-                    best = candidate
-                if (
-                    score_acc_hi >= args.target_acc
-                    and val_orders_per_day >= args.min_orders_per_day
-                    and val_orders >= args.min_total_orders
-                ):
-                    break
-            if best is None:
-                print(
-                    "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} side={} rows={} min={}".format(
-                        symbol, side, len(x), args.min_rows_per_symbol
-                    )
-                )
-                continue
-            best_params = best["params"]
-            train_val_x = pd.concat([x_train_pool, x_val], axis=0)
-            train_val_y = pd.concat([y_train_pool, y_val], axis=0)
-            final_model = build_lr_pipeline(
-                best_params["solver"],
-                c_value=best_params["C"],
-                class_weight=best_params["class_weight"],
-                max_iter=best_params["max_iter"],
-                tol=best_params["tol"],
+            if winrate >= 0.65 and preds >= 500 and preds_per_day >= 7.0:
+                break
+        if best is None:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
+        best_params = best["params"]
+        train_long = pd.concat([x_long_train, x_long_val], axis=0)
+        train_short = pd.concat([x_short_train, x_short_val], axis=0)
+        train_long_y = pd.concat([y_long_train, y_long_val], axis=0)
+        train_short_y = pd.concat([y_short_train, y_short_val], axis=0)
+        final_long = build_lr_pipeline(
+            best_params["solver"],
+            c_value=best_params["C"],
+            class_weight=best_params["class_weight"],
+            max_iter=best_params["max_iter"],
+            tol=best_params["tol"],
+        )
+        final_short = build_lr_pipeline(
+            best_params["solver"],
+            c_value=best_params["C"],
+            class_weight=best_params["class_weight"],
+            max_iter=best_params["max_iter"],
+            tol=best_params["tol"],
+        )
+        final_long.fit(train_long, train_long_y)
+        final_short.fit(train_short, train_short_y)
+        val_sim_path = args.out_dir / symbol / "sim_val.jsonl"
+        val_summary = simulate_trade_only(
+            symbol,
+            val_raw,
+            val_feat,
+            final_long,
+            final_short,
+            val_sim_path,
+            conf_thr=CONF_THRESHOLD,
+            p_trade=P_TRADE,
+            horizon_bars=MAX_HORIZON_BARS,
+        )
+        test_sim_path = args.out_dir / symbol / "sim_test.jsonl"
+        test_summary = simulate_trade_only(
+            symbol,
+            test_raw,
+            test_feat,
+            final_long,
+            final_short,
+            test_sim_path,
+            conf_thr=CONF_THRESHOLD,
+            p_trade=P_TRADE,
+            horizon_bars=MAX_HORIZON_BARS,
+        )
+        print(
+            "FINAL symbol={} winrate={:.6f} preds={} days={} predsPerDay={:.6f}".format(
+                symbol,
+                test_summary["winrate"],
+                test_summary["predCount"],
+                test_summary["daysSpan"],
+                test_summary["predsPerDay"],
             )
-            final_model.fit(train_val_x, train_val_y)
-            val_proba = final_model.predict_proba(x_val)
-            test_proba = final_model.predict_proba(x_test)
-            classes = list(getattr(final_model, "classes_", []))
-            if not classes and isinstance(final_model, Pipeline):
-                classes = list(final_model.named_steps["classifier"].classes_)
-            if 1 not in classes:
-                raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
-            up_class_index = classes.index(1)
-            val_p_hit = val_proba[:, up_class_index]
-            test_p_hit = test_proba[:, up_class_index]
-            val_preds = final_model.predict(x_val)
-            test_preds = final_model.predict(x_test)
-            val_acc_hi, val_coverage, val_orders, val_orders_per_day = compute_confidence_metrics(
-                y_val,
-                val_preds,
-                val_p_hit,
-                conf_threshold=conf_threshold,
-                days_span=val_days,
-            )
-            test_acc_hi, test_coverage, test_orders, test_orders_per_day = compute_confidence_metrics(
-                y_test,
-                test_preds,
-                test_p_hit,
-                conf_threshold=conf_threshold,
-                days_span=test_days,
-            )
+        )
+        if args.eval_only:
             print(
-                "ORDERS symbol={} side={} valOrders={} valOrdersPerDay={:.6f} "
-                "testOrders={} testOrdersPerDay={:.6f}".format(
-                    symbol,
-                    side,
-                    val_orders,
-                    val_orders_per_day,
-                    test_orders,
-                    test_orders_per_day,
+                "EVAL_ONLY symbol={} train_rows={} val_rows={} test_rows={}".format(
+                    symbol, len(train_long), len(x_long_val), len(x_long_test)
                 )
             )
-            print(
-                "FINAL symbol={} side={} testAccHi={} testOrders={} testDays={} testOrdersPerDay={:.6f}".format(
-                    symbol,
-                    side,
-                    "nan" if np.isnan(test_acc_hi) else f"{test_acc_hi:.6f}",
-                    test_orders,
-                    test_days,
-                    test_orders_per_day,
-                )
-            )
-            model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+            continue
+        model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+        train_days = len(extract_dates(feature_files))
+        for side, model, label_type, classes, val_count, test_count in (
+            (
+                "long",
+                final_long,
+                "tp0_004_sl0_002_within_7_event_driven_LONG",
+                list(final_long.named_steps["classifier"].classes_),
+                len(x_long_val),
+                len(x_long_test),
+            ),
+            (
+                "short",
+                final_short,
+                "tp0_004_sl0_002_within_7_event_driven_SHORT",
+                list(final_short.named_steps["classifier"].classes_),
+                len(x_short_val),
+                len(x_short_test),
+            ),
+        ):
             model_dir = args.out_dir / symbol / f"{model_version}_{side}"
-            export_fallback = False
-            if args.eval_only:
-                print(
-                    "EVAL_ONLY symbol={} side={} train_rows={} val_rows={} test_rows={}".format(
-                        symbol, side, len(train_val_x), val_rows, test_rows
-                    )
-                )
-                continue
-            input_names, output_names = export_onnx(final_model, x.shape[1], model_dir / "model.onnx")
+            input_names, output_names = export_onnx(model, len(feature_order), model_dir / "model.onnx")
             print(
                 "ONNX_EXPORT symbol={} side={} inputs={} outputs={}".format(
                     symbol, side, input_names, output_names
                 )
             )
             prob_output_name = "probabilities" if "probabilities" in output_names else None
-            x_check = x.iloc[:256].to_numpy(dtype=np.float32)
+            x_check = train_long.iloc[:256].to_numpy(dtype=np.float32)
             check_onnx_outputs(symbol, model_dir / "model.onnx", x_check)
-            train_days = len(extract_dates(feature_files))
+            up_class_index = classes.index(1) if 1 in classes else 0
+            val_coverage = (
+                val_summary["evalCount"] / val_summary["predCount"] if val_summary["predCount"] else 0.0
+            )
+            test_coverage = (
+                test_summary["evalCount"] / test_summary["predCount"] if test_summary["predCount"] else 0.0
+            )
             write_meta(
                 model_dir / "model_meta.json",
                 model_version,
                 symbol,
                 train_days,
-                len(train_val_x),
+                len(train_long),
                 [int(value) for value in classes],
                 up_class_index,
                 feature_order,
@@ -849,28 +1023,27 @@ def main() -> None:
                 prob_output_name,
                 label_type,
                 best_params,
-                0.0 if np.isnan(val_acc_hi) else float(val_acc_hi),
-                float(val_coverage),
-                val_orders,
-                val_orders_per_day,
-                val_days,
-                val_rows,
-                0.0 if np.isnan(test_acc_hi) else float(test_acc_hi),
-                float(test_coverage),
-                test_orders,
-                test_orders_per_day,
-                test_days,
-                test_rows,
-                export_fallback,
+                val_summary["winrate"],
+                val_coverage,
+                val_summary["predCount"],
+                val_summary["predsPerDay"],
+                val_summary["daysSpan"],
+                val_count,
+                test_summary["winrate"],
+                test_coverage,
+                test_summary["predCount"],
+                test_summary["predsPerDay"],
+                test_summary["daysSpan"],
+                test_count,
+                False,
             )
             write_current(model_dir, args.out_dir, symbol, side)
-            wrote_path = args.out_dir / symbol / f"current_{side}"
             print(
                 "TRAIN_SYMBOL symbol={} side={} rows={} wrote={}".format(
                     symbol,
                     side,
-                    len(train_val_x),
-                    wrote_path,
+                    len(train_long) if side == "long" else len(train_short),
+                    args.out_dir / symbol / f"current_{side}",
                 )
             )
 
