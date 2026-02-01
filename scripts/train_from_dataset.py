@@ -800,6 +800,20 @@ def main() -> None:
             print("EMPTY_TRAIN_FRAME_COLUMNS symbol={} side=SHORT columns={}".format(symbol, list(frame_short.columns)))
         if len(frame_long) == 0 or len(frame_short) == 0:
             continue
+        if len(frame_long) < args.min_rows_per_symbol:
+            print(
+                "SKIP_LONG_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
+                    symbol, len(frame_long), args.min_rows_per_symbol
+                )
+            )
+            continue
+        if len(frame_short) < args.min_rows_per_symbol:
+            print(
+                "SKIP_SHORT_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
+                    symbol, len(frame_short), args.min_rows_per_symbol
+                )
+            )
+            continue
         close_times = features_filtered["closeTimeMs"].sort_values().to_numpy()
         if len(close_times) <= args.test_rows + args.val_rows:
             print(
@@ -853,19 +867,33 @@ def main() -> None:
         y_long_test = y_long.loc[test_mask_long]
         x_short_test = x_short.loc[test_mask_short]
         y_short_test = y_short.loc[test_mask_short]
-        if len(x_long_train) < args.min_rows_per_symbol:
-            print(
-                "SKIP_LONG_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
-                    symbol, len(x_long_train), args.min_rows_per_symbol
-                )
+        pos_long = int(y_long_train.sum()) if len(y_long_train) else 0
+        neg_long = len(y_long_train) - pos_long
+        pos_long_rate = pos_long / len(y_long_train) if len(y_long_train) else 0.0
+        print(
+            "CLASS_COUNTS symbol={} side=long pos={} neg={} posRate={:.6f}".format(
+                symbol,
+                pos_long,
+                neg_long,
+                pos_long_rate,
             )
+        )
+        pos_short = int(y_short_train.sum()) if len(y_short_train) else 0
+        neg_short = len(y_short_train) - pos_short
+        pos_short_rate = pos_short / len(y_short_train) if len(y_short_train) else 0.0
+        print(
+            "CLASS_COUNTS symbol={} side=short pos={} neg={} posRate={:.6f}".format(
+                symbol,
+                pos_short,
+                neg_short,
+                pos_short_rate,
+            )
+        )
+        if pos_long < 2000:
+            print("SKIP_LONG_NOT_ENOUGH_POS symbol={} pos={} min=2000".format(symbol, pos_long))
             continue
-        if len(x_short_train) < args.min_rows_per_symbol:
-            print(
-                "SKIP_SHORT_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
-                    symbol, len(x_short_train), args.min_rows_per_symbol
-                )
-            )
+        if pos_short < 2000:
+            print("SKIP_SHORT_NOT_ENOUGH_POS symbol={} pos={} min=2000".format(symbol, pos_short))
             continue
         if len(x_long_val) == 0 or len(x_short_val) == 0 or len(x_long_test) == 0 or len(x_short_test) == 0:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
