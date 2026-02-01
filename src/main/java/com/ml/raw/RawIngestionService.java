@@ -8,7 +8,6 @@ import com.ml.features.LabelWriter;
 import com.ml.features.RollingFeatureState;
 import com.ml.features.RollingFeatureStateRegistry;
 import com.ml.config.RawIngestionProperties;
-import com.ml.pred.ModelMeta;
 import com.ml.pred.OnnxInferenceService;
 import com.ml.pred.OnnxModelLoader;
 import com.ml.pred.EvalRecord;
@@ -21,8 +20,6 @@ import com.ml.ws.WsEnvelope;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayDeque;
-import java.util.Deque;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -44,7 +41,8 @@ public class RawIngestionService implements ApplicationRunner {
     private static final DateTimeFormatter ISO_FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
     private static final double TP_PCT = 0.004d;
     private static final double SL_PCT = 0.002d;
-    private static final int MAX_HORIZON_BARS = 7;
+    private static final double P_TRADE = 0.55d;
+    private static final int HORIZON_BARS = 7;
 
     private final BinanceWsClient wsClient;
     private final RawRecordBuilder recordBuilder;
@@ -58,7 +56,7 @@ public class RawIngestionService implements ApplicationRunner {
     private final OnnxModelLoader onnxModelLoader;
     private final PredWriter predWriter;
     private final RawIngestionProperties properties;
-    private final Map<String, Deque<PendingPrediction>> pendingBySymbol = new ConcurrentHashMap<>();
+    private final Map<String, PendingTrade> pendingBySymbol = new ConcurrentHashMap<>();
 
     public RawIngestionService(
             BinanceWsClient wsClient,
@@ -149,8 +147,8 @@ public class RawIngestionService implements ApplicationRunner {
                                 symbolState.getLastFeaturesCloseTimeMs(symbol));
                     }
                 }
-                evaluatePendingPredictions(symbol, previous, record);
-                if (featureRecord != null) {
+                evaluatePendingWithBar(symbol, previous, record);
+                if (featureRecord != null && !pendingBySymbol.containsKey(symbol)) {
                     writePrediction(symbol, featureRecord);
                 }
             } catch (Exception ex) {
@@ -161,144 +159,89 @@ public class RawIngestionService implements ApplicationRunner {
 
     private void writePrediction(String symbol, FeatureRecord featureRecord) {
         if (!featureRecord.isWindowReady()) {
-            log.info("PRED_SKIP_NOT_READY symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs());
             return;
         }
         long lastPred = symbolState.getLastPredCloseTimeMs(symbol);
         if (featureRecord.getCloseTimeMs() <= lastPred) {
-            log.info("PRED_SKIP_DUP symbol={} closeTimeMs={} last={}",
-                    symbol,
-                    featureRecord.getCloseTimeMs(),
-                    lastPred);
             return;
         }
-        Optional<OnnxModelLoader.ModelBundle> modelOpt = onnxModelLoader.getModel(symbol);
+        Optional<OnnxModelLoader.ModelPair> modelOpt = onnxModelLoader.getModelPair(symbol);
         if (modelOpt.isEmpty()) {
             return;
         }
-        ModelMeta modelMeta = modelOpt.get().getMeta();
-        if (modelMeta == null) {
-            return;
-        }
-        logPredInputDebug(symbol, featureRecord, modelMeta);
+        OnnxModelLoader.ModelPair modelPair = modelOpt.get();
         try {
-            Optional<Double> pUpOpt = onnxInferenceService.predict(featureRecord, modelOpt.get());
-            if (pUpOpt.isEmpty()) {
+            Optional<Double> pLongOpt = onnxInferenceService.predict(featureRecord, modelPair.getLongModel());
+            Optional<Double> pShortOpt = onnxInferenceService.predict(featureRecord, modelPair.getShortModel());
+            if (pLongOpt.isEmpty() || pShortOpt.isEmpty()) {
                 return;
             }
-            double pUp = pUpOpt.get();
-            double minConfidence = resolveMinConfidence(modelMeta);
-            double minAbsExpectedPct = resolveMinAbsExpectedPct(modelMeta);
-            double minAbsEdge = resolveMinAbsEdge(modelMeta);
+            double pLongHit = pLongOpt.get();
+            double pShortHit = pShortOpt.get();
+            double best = Math.max(pLongHit, pShortHit);
+            if (best < P_TRADE) {
+                return;
+            }
+            String direction = pLongHit > pShortHit ? "UP" : "DOWN";
+            double pHit = direction.equals("UP") ? pLongHit : pShortHit;
             PredRecord predRecord = new PredRecord();
             predRecord.setType("PRED");
             predRecord.setSymbol(symbol);
             predRecord.setTf(featureRecord.getTf());
             predRecord.setCloseTimeMs(featureRecord.getCloseTimeMs());
             predRecord.setCloseTime(formatMs(featureRecord.getCloseTimeMs()));
-            predRecord.setFeaturesVersion(featureRecord.getFeaturesVersion());
-            predRecord.setModelVersion(modelMeta.getModelVersion());
-            predRecord.setPUp(pUp);
+            predRecord.setHorizonBars(HORIZON_BARS);
+            predRecord.setTpPct(TP_PCT);
+            predRecord.setSlPct(SL_PCT);
+            predRecord.setDirection(direction);
+            predRecord.setPHit(pHit);
+            predRecord.setPTrade(P_TRADE);
             predRecord.setLoggedAtMs(System.currentTimeMillis());
             predRecord.setLoggedAt(formatMs(predRecord.getLoggedAtMs()));
-            double conf = Math.max(pUp, 1.0d - pUp);
+            double conf = Math.max(pHit, 1.0d - pHit);
             predRecord.setConfidence(conf);
-            double edgeAbs = Math.abs(pUp - 0.5d);
-            predRecord.setEdgeAbs(edgeAbs);
-            Double expectedPct = null;
-            Double expectedBp = null;
-            Double meanRetUp = modelMeta.getMeanRetUp();
-            Double meanRetDown = modelMeta.getMeanRetDown();
-            if (meanRetUp != null && meanRetDown != null) {
-                double expectedRet = pUp * meanRetUp + (1.0d - pUp) * meanRetDown;
-                expectedPct = expectedRet;
-                predRecord.setExpectedPct(expectedPct);
-                expectedBp = expectedPct * 10000.0d;
-                predRecord.setExpectedBp(expectedBp);
-            }
-            predRecord.setMinConfidence(minConfidence);
-            predRecord.setMinAbsExpectedPct(minAbsExpectedPct);
-            predRecord.setMinAbsEdge(minAbsEdge);
-            boolean lowExpected = expectedPct != null && Math.abs(expectedPct) < minAbsExpectedPct;
-            boolean lowEdge = edgeAbs < minAbsEdge;
-            String decisionReason = "DIRECT";
-            String failedGate = "NONE";
-            String decision;
-            if (conf < minConfidence) {
-                decision = "NO_TRADE";
-                decisionReason = "LOW_CONF";
-                failedGate = "CONFIDENCE";
-            } else if (lowExpected || lowEdge) {
-                decision = "NO_TRADE";
-                if (lowExpected && lowEdge) {
-                    decisionReason = "LOW_EXPECTED|LOW_EDGE";
-                    failedGate = "EXPECTED+EDGE";
-                } else if (lowExpected) {
-                    decisionReason = "LOW_EXPECTED";
-                    failedGate = "EXPECTED";
-                } else {
-                    decisionReason = "LOW_EDGE";
-                    failedGate = "EDGE";
-                }
-            } else {
-                decision = pUp >= 0.5d ? "UP" : "DOWN";
-            }
-            predRecord.setDirection(decision);
-            predRecord.setDecisionReason(decisionReason);
-            predRecord.setFailedGate(failedGate);
             double entryPrice = parseDouble(featureRecord.getClosePrice());
-            if (entryPrice > 0.0d && !"NO_TRADE".equalsIgnoreCase(decision)) {
-                if ("UP".equalsIgnoreCase(decision)) {
-                    predRecord.setEntryPrice(entryPrice);
-                    predRecord.setTpPrice(entryPrice * (1.0d + TP_PCT));
-                    predRecord.setSlPrice(entryPrice * (1.0d - SL_PCT));
-                } else {
-                    predRecord.setEntryPrice(entryPrice);
-                    predRecord.setTpPrice(entryPrice * (1.0d - TP_PCT));
-                    predRecord.setSlPrice(entryPrice * (1.0d + SL_PCT));
-                }
+            if (entryPrice <= 0.0d) {
+                return;
+            }
+            predRecord.setEntryPrice(entryPrice);
+            if ("UP".equalsIgnoreCase(direction)) {
+                predRecord.setTpPrice(entryPrice * (1.0d + TP_PCT));
+                predRecord.setSlPrice(entryPrice * (1.0d - SL_PCT));
+            } else {
+                predRecord.setTpPrice(entryPrice * (1.0d - TP_PCT));
+                predRecord.setSlPrice(entryPrice * (1.0d + SL_PCT));
             }
             predWriter.append(predRecord);
             log.info(
-                    "PRED symbol={} closeTimeMs={} pUp={} conf={} edgeAbs={} expectedPct={} expectedBp={} "
-                            + "minConfidence={} minAbsExpectedPct={} minAbsEdge={} failedGate={} decision={} "
-                            + "reason={} modelVersion={}",
+                    "PRED symbol={} closeTimeMs={} direction={} pHit={} pTrade={} conf={}",
                     symbol,
                     featureRecord.getCloseTimeMs(),
-                    pUp,
+                    direction,
+                    pHit,
+                    P_TRADE,
                     conf,
-                    edgeAbs,
-                    expectedPct,
-                    expectedBp,
-                    minConfidence,
-                    minAbsExpectedPct,
-                    minAbsEdge,
-                    failedGate,
-                    predRecord.getDirection(),
-                    decisionReason,
-                    modelMeta.getModelVersion());
+                    conf);
             symbolState.updatePredIfNewer(symbol, featureRecord.getCloseTimeMs());
-            symbolState.setLastPredInfo(symbol, predRecord.getDirection(), pUp);
-            if ("UP".equalsIgnoreCase(decision) || "DOWN".equalsIgnoreCase(decision)) {
-                enqueuePending(symbol, featureRecord, predRecord);
-            }
+            symbolState.setLastPredInfo(symbol, predRecord.getDirection(), pHit);
+            enqueuePending(symbol, featureRecord, predRecord);
         } catch (Exception ex) {
             log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs(), ex);
         }
     }
 
-    private void evaluatePendingPredictions(String symbol, RollingFeatureState.Bar previous, RawRecord current) {
+    private void evaluatePendingWithBar(String symbol, RollingFeatureState.Bar previous, RawRecord current) {
         if (previous == null) {
             return;
         }
-        Deque<PendingPrediction> pending = pendingBySymbol.computeIfAbsent(symbol, key -> new ArrayDeque<>());
-        if (pending.isEmpty()) {
+        PendingTrade pending = pendingBySymbol.get(symbol);
+        if (pending == null) {
             return;
         }
         long expectedGap = properties.getExpectedGapMs() == null ? 300_000L : properties.getExpectedGapMs();
         long gapMs = current.getCloseTimeMs() - previous.getCloseTimeMs();
         if (gapMs != expectedGap) {
-            pending.clear();
+            pendingBySymbol.remove(symbol);
             return;
         }
         double barHigh = parseDouble(current.getHighPrice());
@@ -306,51 +249,53 @@ public class RawIngestionService implements ApplicationRunner {
         if (barHigh == 0.0d || barLow == 0.0d) {
             return;
         }
-        pending.removeIf(item -> {
-            item.incrementBarsWaited();
-            if (item.getBarsWaited() > MAX_HORIZON_BARS) {
-                return true;
+        boolean hitTp;
+        boolean hitSl;
+        if ("UP".equalsIgnoreCase(pending.getDirection())) {
+            hitTp = barHigh >= pending.getTpPrice();
+            hitSl = barLow <= pending.getSlPrice();
+        } else {
+            hitTp = barLow <= pending.getTpPrice();
+            hitSl = barHigh >= pending.getSlPrice();
+        }
+        if (!(hitTp || hitSl)) {
+            pending.decrementBarsLeft();
+            if (pending.getBarsLeft() <= 0) {
+                pendingBySymbol.remove(symbol);
             }
-            boolean hitTp;
-            boolean hitSl;
-            if ("UP".equalsIgnoreCase(item.getDirection())) {
-                hitTp = barHigh >= item.getTpPrice();
-                hitSl = barLow <= item.getSlPrice();
-            } else {
-                hitTp = barLow <= item.getTpPrice();
-                hitSl = barHigh >= item.getSlPrice();
-            }
-            if (!(hitTp || hitSl)) {
-                return false;
-            }
-            String event = hitSl ? "SL_HIT" : "TP_HIT";
-            String result = hitSl ? "NOK" : "OK";
-            EvalRecord evalRecord = new EvalRecord();
-            evalRecord.setType("EVAL");
-            evalRecord.setSymbol(symbol);
-            evalRecord.setTf(properties.getTf());
-            evalRecord.setPredCloseTimeMs(item.getPredCloseTimeMs());
-            evalRecord.setEventCloseTimeMs(current.getCloseTimeMs());
-            evalRecord.setDirection(item.getDirection());
-            evalRecord.setEntryPrice(item.getEntryPrice());
-            evalRecord.setTpPrice(item.getTpPrice());
-            evalRecord.setSlPrice(item.getSlPrice());
-            evalRecord.setResult(result);
-            evalRecord.setEvent(event);
-            evalRecord.setLoggedAtMs(System.currentTimeMillis());
-            evalRecord.setLoggedAt(formatMs(evalRecord.getLoggedAtMs()));
-            try {
-                predWriter.append(evalRecord);
-                log.info("EVAL symbol={} predCloseTimeMs={} result={} event={}",
-                        symbol,
-                        item.getPredCloseTimeMs(),
-                        result,
-                        event);
-            } catch (Exception ex) {
-                log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, current.getCloseTimeMs(), ex);
-            }
-            return true;
-        });
+            return;
+        }
+        String event = hitSl ? "SL_HIT" : "TP_HIT";
+        String result = hitSl ? "NOK" : "OK";
+        if (hitTp && hitSl) {
+            event = "SL_HIT_SAME_BAR";
+            result = "NOK";
+        }
+        EvalRecord evalRecord = new EvalRecord();
+        evalRecord.setType("EVAL");
+        evalRecord.setSymbol(symbol);
+        evalRecord.setTf(properties.getTf());
+        evalRecord.setPredCloseTimeMs(pending.getPredCloseTimeMs());
+        evalRecord.setEventCloseTimeMs(current.getCloseTimeMs());
+        evalRecord.setDirection(pending.getDirection());
+        evalRecord.setEntryPrice(pending.getEntryPrice());
+        evalRecord.setTpPrice(pending.getTpPrice());
+        evalRecord.setSlPrice(pending.getSlPrice());
+        evalRecord.setResult(result);
+        evalRecord.setEvent(event);
+        evalRecord.setLoggedAtMs(System.currentTimeMillis());
+        evalRecord.setLoggedAt(formatMs(evalRecord.getLoggedAtMs()));
+        try {
+            predWriter.append(evalRecord);
+            log.info("EVAL symbol={} predCloseTimeMs={} result={} event={}",
+                    symbol,
+                    pending.getPredCloseTimeMs(),
+                    result,
+                    event);
+        } catch (Exception ex) {
+            log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, current.getCloseTimeMs(), ex);
+        }
+        pendingBySymbol.remove(symbol);
     }
 
     private void enqueuePending(String symbol, FeatureRecord featureRecord, PredRecord predRecord) {
@@ -360,14 +305,15 @@ public class RawIngestionService implements ApplicationRunner {
         if (entryPrice <= 0.0d || tpPrice == null || slPrice == null) {
             return;
         }
-        PendingPrediction pending = new PendingPrediction(
+        PendingTrade pending = new PendingTrade(
                 featureRecord.getCloseTimeMs(),
                 entryPrice,
                 predRecord.getDirection(),
                 tpPrice,
-                slPrice
+                slPrice,
+                HORIZON_BARS
         );
-        pendingBySymbol.computeIfAbsent(symbol, key -> new ArrayDeque<>()).addLast(pending);
+        pendingBySymbol.put(symbol, pending);
     }
 
     private LabelRecord buildLabel(RollingFeatureState state, RawRecord current) {
@@ -432,112 +378,34 @@ public class RawIngestionService implements ApplicationRunner {
         return symbol.toUpperCase(Locale.ROOT);
     }
 
-    private void logPredInputDebug(String symbol, FeatureRecord featureRecord, ModelMeta meta) {
-        long count = symbolState.incrementPredDebugCount(symbol);
-        if (count > 3) {
-            return;
-        }
-        if (meta.getFeatureOrder() == null || meta.getFeatureOrder().isEmpty()) {
-            return;
-        }
-        StringBuilder builder = new StringBuilder();
-        builder.append("PRED_INPUT_DEBUG symbol=").append(symbol)
-                .append(" closeTimeMs=").append(featureRecord.getCloseTimeMs());
-        int limit = Math.min(8, meta.getFeatureOrder().size());
-        boolean hasNaN = false;
-        for (int i = 0; i < meta.getFeatureOrder().size(); i++) {
-            String name = meta.getFeatureOrder().get(i);
-            Double value = resolveFeatureValue(featureRecord, name);
-            if (value != null && value.isNaN()) {
-                hasNaN = true;
-            }
-            if (i < limit) {
-                builder.append(" f").append(i).append("=")
-                        .append(name)
-                        .append(":")
-                        .append(value == null ? "null" : value);
-            }
-        }
-        builder.append(" hasNaN=").append(hasNaN);
-        log.info(builder.toString());
-    }
-
-    private Double resolveFeatureValue(FeatureRecord record, String name) {
-        return switch (name) {
-            case "ret_1" -> record.getRet_1();
-            case "logRet_1" -> record.getLogRet_1();
-            case "ret_3" -> record.getRet_3();
-            case "ret_12" -> record.getRet_12();
-            case "realizedVol_6" -> record.getRealizedVol_6();
-            case "realizedVol_24" -> record.getRealizedVol_24();
-            case "rangePct" -> record.getRangePct();
-            case "bodyPct" -> record.getBodyPct();
-            case "upperWickPct" -> record.getUpperWickPct();
-            case "lowerWickPct" -> record.getLowerWickPct();
-            case "closePos" -> record.getClosePos();
-            case "volRatio_12" -> record.getVolRatio_12();
-            case "tradeRatio_12" -> record.getTradeRatio_12();
-            case "buySellRatio" -> record.getBuySellRatio();
-            case "deltaVolNorm" -> record.getDeltaVolNorm();
-            case "rsi14" -> record.getRsi14();
-            case "atr14" -> record.getAtr14();
-            case "ema20DistPct" -> record.getEma20DistPct();
-            case "ema200DistPct" -> record.getEma200DistPct();
-            default -> null;
-        };
-    }
-
-    private double resolveMinConfidence(ModelMeta meta) {
-        double fallback = properties.getDecision() == null || properties.getDecision().getMinConfidence() == null
-                ? 0.55d
-                : properties.getDecision().getMinConfidence();
-        if (meta.getDecisionPolicy() != null && meta.getDecisionPolicy().getMinConfidence() != null) {
-            return meta.getDecisionPolicy().getMinConfidence();
-        }
-        return fallback;
-    }
-
-    private double resolveMinAbsExpectedPct(ModelMeta meta) {
-        double fallback = properties.getDecision() == null || properties.getDecision().getMinAbsExpectedPct() == null
-                ? 0.002d
-                : properties.getDecision().getMinAbsExpectedPct();
-        if (meta.getDecisionPolicy() != null && meta.getDecisionPolicy().getMinAbsExpectedPct() != null) {
-            return meta.getDecisionPolicy().getMinAbsExpectedPct();
-        }
-        return fallback;
-    }
-
-    private double resolveMinAbsEdge(ModelMeta meta) {
-        double fallback = properties.getDecision() == null || properties.getDecision().getMinAbsEdge() == null
-                ? 0.05d
-                : properties.getDecision().getMinAbsEdge();
-        if (meta.getDecisionPolicy() != null && meta.getDecisionPolicy().getMinAbsEdge() != null) {
-            return meta.getDecisionPolicy().getMinAbsEdge();
-        }
-        return fallback;
-    }
-
     private String formatMs(long epochMs) {
         return Instant.ofEpochMilli(epochMs)
                 .atZone(ISTANBUL_ZONE)
                 .format(ISO_FORMATTER);
     }
 
-    private static final class PendingPrediction {
+    private static final class PendingTrade {
         private final long predCloseTimeMs;
         private final double entryPrice;
         private final String direction;
         private final double tpPrice;
         private final double slPrice;
-        private int barsWaited;
+        private int barsLeft;
 
-        private PendingPrediction(long predCloseTimeMs, double entryPrice, String direction, double tpPrice, double slPrice) {
+        private PendingTrade(
+                long predCloseTimeMs,
+                double entryPrice,
+                String direction,
+                double tpPrice,
+                double slPrice,
+                int barsLeft
+        ) {
             this.predCloseTimeMs = predCloseTimeMs;
             this.entryPrice = entryPrice;
             this.direction = direction;
             this.tpPrice = tpPrice;
             this.slPrice = slPrice;
-            this.barsWaited = 0;
+            this.barsLeft = barsLeft;
         }
 
         private long getPredCloseTimeMs() {
@@ -560,12 +428,12 @@ public class RawIngestionService implements ApplicationRunner {
             return slPrice;
         }
 
-        private int getBarsWaited() {
-            return barsWaited;
+        private int getBarsLeft() {
+            return barsLeft;
         }
 
-        private void incrementBarsWaited() {
-            barsWaited += 1;
+        private void decrementBarsLeft() {
+            barsLeft -= 1;
         }
     }
 }
