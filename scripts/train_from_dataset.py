@@ -16,6 +16,7 @@ import pandas as pd
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import log_loss
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 
@@ -45,9 +46,15 @@ FEATURES_VERSION = "ftr_5m_v1"
 MAX_HORIZON_BARS = 7
 TP_PCT = 0.004
 SL_PCT = 0.002
-GAP_MS = 300000
+GAP_MS = 300_000
+HORIZON_BARS = 7
 CONF_THRESHOLD = 0.55
 P_TRADE = 0.55
+MIN_TRADE_PER_DAY = 7.0
+MIN_TRADES_VAL = 500
+MIN_TRADES_TEST = 500
+TARGET_WINRATE = 0.65
+MIN_TRAIN_ROWS = 20_000
 TRAIN_LIMIT = 400000
 MIN_POS_TRAIN = 2000
 
@@ -58,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default=Path("models"), type=Path, help="Output models directory")
     parser.add_argument("--exclude-today", action="store_true", help="Exclude today's partition (Europe/Istanbul)")
     parser.add_argument("--symbols", default=None, help="Comma-separated symbols to include")
-    parser.add_argument("--min-rows-per-symbol", default=20000, type=int, help="Minimum rows required to train")
+    parser.add_argument("--min-rows-per-symbol", default=MIN_TRAIN_ROWS, type=int, help="Minimum rows required to train")
     parser.add_argument("--train-rows", default=None, type=int, help="Rows to use for training (most recent)")
     parser.add_argument("--test-rows", default=100000, type=int, help="Rows to hold out for evaluation")
     parser.add_argument("--val-rows", default=50000, type=int, help="Rows to hold out for validation")
@@ -567,25 +574,53 @@ def build_lr_pipeline(
     )
 
 
-def build_hgb_model(
-    *,
-    max_iter: int,
-    learning_rate: float,
-    max_depth: int,
-    min_samples_leaf: int,
-    l2_regularization: float,
-) -> HistGradientBoostingClassifier:
+def make_hgb(params: dict[str, object]) -> HistGradientBoostingClassifier:
     return HistGradientBoostingClassifier(
-        max_iter=max_iter,
-        learning_rate=learning_rate,
-        max_depth=max_depth,
-        min_samples_leaf=min_samples_leaf,
-        l2_regularization=l2_regularization,
-        early_stopping=True,
-        validation_fraction=0.1,
+        loss="log_loss",
+        max_iter=params["max_iter"],
+        learning_rate=params["learning_rate"],
+        max_depth=params["max_depth"],
+        min_samples_leaf=params["min_samples_leaf"],
+        l2_regularization=params["l2_regularization"],
+        early_stopping=False,
+        validation_fraction=None,
         n_iter_no_change=20,
         random_state=42,
+        class_weight=params["class_weight"],
     )
+
+
+def fit_hgb_time_series(
+    model: HistGradientBoostingClassifier,
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    x_val: pd.DataFrame,
+    y_val: pd.Series,
+) -> HistGradientBoostingClassifier:
+    model.set_params(warm_start=True)
+    best_iter = 0
+    best_loss = float("inf")
+    no_improve = 0
+    max_iter = model.max_iter
+    for iteration in range(1, max_iter + 1):
+        model.set_params(max_iter=iteration)
+        model.fit(x_train, y_train)
+        if x_val.empty:
+            continue
+        probs = model.predict_proba(x_val)
+        loss = log_loss(y_val, probs, labels=model.classes_)
+        if loss < best_loss - 1e-6:
+            best_loss = loss
+            best_iter = iteration
+            no_improve = 0
+        else:
+            no_improve += 1
+        if no_improve >= model.n_iter_no_change:
+            break
+    if best_iter and best_iter != model.max_iter:
+        model.set_params(max_iter=best_iter)
+        model.fit(x_train, y_train)
+    return model
 
 
 def export_onnx(model, feature_count: int, output_path: Path) -> tuple[list[str], list[str]]:
@@ -631,6 +666,7 @@ def write_meta(
     test_days: int,
     test_rows: int,
     export_fallback: bool,
+    trained: bool,
 ) -> None:
     def _json_default(o):
         if isinstance(o, np.integer):
@@ -647,6 +683,7 @@ def write_meta(
 
     meta = {
         "modelType": model_type,
+        "trained": trained,
         "modelVersion": model_version,
         "symbol": symbol,
         "featuresVersion": FEATURES_VERSION,
@@ -673,6 +710,7 @@ def write_meta(
         "valPredsPerDay": val_orders_per_day,
         "valDaysSpan": val_days,
         "valDays": val_days,
+        "valWinrate": val_acc_hi,
         "valRows": val_rows,
         "testAccHi": test_acc_hi,
         "testCoverage": test_coverage,
@@ -682,6 +720,7 @@ def write_meta(
         "testPredsPerDay": test_orders_per_day,
         "testDaysSpan": test_days,
         "testDays": test_days,
+        "testWinrate": test_acc_hi,
         "testRows": test_rows,
         "exportFallback": export_fallback,
         "onnxOutputs": onnx_outputs,
@@ -823,38 +862,73 @@ def main() -> None:
                 len(frame_short),
             )
         )
-        if len(frame_long) == 0:
+        long_rows = len(frame_long)
+        short_rows = len(frame_short)
+        if long_rows == 0:
             print("EMPTY_TRAIN_FRAME symbol={} side=LONG reason=missing_label_column_or_filter".format(symbol))
             print("EMPTY_TRAIN_FRAME_COLUMNS symbol={} side=LONG columns={}".format(symbol, list(frame_long.columns)))
-        if len(frame_short) == 0:
+        if short_rows == 0:
             print("EMPTY_TRAIN_FRAME symbol={} side=SHORT reason=missing_label_column_or_filter".format(symbol))
             print("EMPTY_TRAIN_FRAME_COLUMNS symbol={} side=SHORT columns={}".format(symbol, list(frame_short.columns)))
-        if len(frame_long) == 0 or len(frame_short) == 0:
+        if long_rows == 0 and short_rows == 0:
             continue
-        if len(frame_long) < args.min_rows_per_symbol:
+        long_ready = True
+        short_ready = True
+        if long_rows < args.min_rows_per_symbol:
             print(
                 "SKIP_LONG_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
-                    symbol, len(frame_long), args.min_rows_per_symbol
+                    symbol, long_rows, args.min_rows_per_symbol
                 )
             )
-            continue
-        if len(frame_short) < args.min_rows_per_symbol:
+            long_ready = False
+        if short_rows < args.min_rows_per_symbol:
             print(
                 "SKIP_SHORT_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
-                    symbol, len(frame_short), args.min_rows_per_symbol
+                    symbol, short_rows, args.min_rows_per_symbol
                 )
             )
+            short_ready = False
+        if not long_ready and not short_ready:
             continue
         close_times = features_filtered["closeTimeMs"].sort_values().to_numpy()
-        if len(close_times) <= args.test_rows + args.val_rows:
+        total_rows = len(close_times)
+        if total_rows < MIN_TRAIN_ROWS:
             print(
                 "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
-                    symbol, len(close_times), args.min_rows_per_symbol
+                    symbol, total_rows, args.min_rows_per_symbol
                 )
             )
             continue
-        test_start_idx = len(close_times) - args.test_rows
-        val_start_idx = test_start_idx - args.val_rows
+        test_rows = min(args.test_rows, max(5000, total_rows // 5))
+        val_rows = min(args.val_rows, max(2000, total_rows // 10))
+        while total_rows - test_rows - val_rows < MIN_TRAIN_ROWS and (test_rows > 0 or val_rows > 0):
+            if test_rows > 0:
+                test_rows = max(0, int(test_rows * 0.9))
+            if val_rows > 0:
+                val_rows = max(0, int(val_rows * 0.9))
+            if test_rows == 0 and val_rows == 0:
+                break
+        if total_rows - test_rows - val_rows < MIN_TRAIN_ROWS:
+            remaining = total_rows - MIN_TRAIN_ROWS
+            if remaining <= 0:
+                print(
+                    "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
+                        symbol, total_rows, args.min_rows_per_symbol
+                    )
+                )
+                continue
+            test_rows = min(test_rows, remaining)
+            remaining -= test_rows
+            val_rows = min(val_rows, max(0, remaining))
+        if total_rows - test_rows - val_rows < MIN_TRAIN_ROWS:
+            print(
+                "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
+                    symbol, total_rows, args.min_rows_per_symbol
+                )
+            )
+            continue
+        test_start_idx = total_rows - test_rows
+        val_start_idx = test_start_idx - val_rows
         val_start_ms = close_times[val_start_idx]
         test_start_ms = close_times[test_start_idx]
         train_end_ms = val_start_ms
@@ -872,7 +946,7 @@ def main() -> None:
         (long_data, short_data, feature_order) = build_training_frames(features, raw)
         x_long, y_long, close_long = long_data
         x_short, y_short, close_short = short_data
-        if x_long.empty or x_short.empty:
+        if x_long.empty and x_short.empty:
             if x_long.empty:
                 print("EMPTY_TRAIN_FRAME symbol={} side=LONG reason=missing_label_column_or_filter".format(symbol))
                 print("EMPTY_TRAIN_FRAME_COLUMNS symbol={} side=LONG columns={}".format(symbol, list(frame_long.columns)))
@@ -902,22 +976,72 @@ def main() -> None:
         neg_long = len(y_long_train) - pos_long
         pos_long_rate = pos_long / len(y_long_train) if len(y_long_train) else 0.0
         print(
-            "CLASS_COUNTS symbol={} side=long pos={} neg={} posRate={:.6f}".format(
+            "CLASS_COUNTS_TRAIN symbol={} side=long pos={} neg={} posRate={:.6f} n={}".format(
                 symbol,
                 pos_long,
                 neg_long,
                 pos_long_rate,
+                len(y_long_train),
             )
         )
         pos_short = int(y_short_train.sum()) if len(y_short_train) else 0
         neg_short = len(y_short_train) - pos_short
         pos_short_rate = pos_short / len(y_short_train) if len(y_short_train) else 0.0
         print(
-            "CLASS_COUNTS symbol={} side=short pos={} neg={} posRate={:.6f}".format(
+            "CLASS_COUNTS_TRAIN symbol={} side=short pos={} neg={} posRate={:.6f} n={}".format(
                 symbol,
                 pos_short,
                 neg_short,
                 pos_short_rate,
+                len(y_short_train),
+            )
+        )
+        pos_long_val = int(y_long_val.sum()) if len(y_long_val) else 0
+        neg_long_val = len(y_long_val) - pos_long_val
+        pos_long_val_rate = pos_long_val / len(y_long_val) if len(y_long_val) else 0.0
+        print(
+            "CLASS_COUNTS_VAL symbol={} side=long pos={} neg={} posRate={:.6f} n={}".format(
+                symbol,
+                pos_long_val,
+                neg_long_val,
+                pos_long_val_rate,
+                len(y_long_val),
+            )
+        )
+        pos_short_val = int(y_short_val.sum()) if len(y_short_val) else 0
+        neg_short_val = len(y_short_val) - pos_short_val
+        pos_short_val_rate = pos_short_val / len(y_short_val) if len(y_short_val) else 0.0
+        print(
+            "CLASS_COUNTS_VAL symbol={} side=short pos={} neg={} posRate={:.6f} n={}".format(
+                symbol,
+                pos_short_val,
+                neg_short_val,
+                pos_short_val_rate,
+                len(y_short_val),
+            )
+        )
+        pos_long_test = int(y_long_test.sum()) if len(y_long_test) else 0
+        neg_long_test = len(y_long_test) - pos_long_test
+        pos_long_test_rate = pos_long_test / len(y_long_test) if len(y_long_test) else 0.0
+        print(
+            "CLASS_COUNTS_TEST symbol={} side=long pos={} neg={} posRate={:.6f} n={}".format(
+                symbol,
+                pos_long_test,
+                neg_long_test,
+                pos_long_test_rate,
+                len(y_long_test),
+            )
+        )
+        pos_short_test = int(y_short_test.sum()) if len(y_short_test) else 0
+        neg_short_test = len(y_short_test) - pos_short_test
+        pos_short_test_rate = pos_short_test / len(y_short_test) if len(y_short_test) else 0.0
+        print(
+            "CLASS_COUNTS_TEST symbol={} side=short pos={} neg={} posRate={:.6f} n={}".format(
+                symbol,
+                pos_short_test,
+                neg_short_test,
+                pos_short_test_rate,
+                len(y_short_test),
             )
         )
         if pos_long < MIN_POS_TRAIN:
@@ -926,16 +1050,39 @@ def main() -> None:
                     symbol, pos_long, MIN_POS_TRAIN
                 )
             )
-            continue
+            long_ready = False
         if pos_short < MIN_POS_TRAIN:
             print(
                 "SKIP_SHORT_NOT_ENOUGH_POS_TRAIN symbol={} pos={} min={}".format(
                     symbol, pos_short, MIN_POS_TRAIN
                 )
             )
-            continue
-        if len(x_long_val) == 0 or len(x_short_val) == 0 or len(x_long_test) == 0 or len(x_short_test) == 0:
-            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            short_ready = False
+        if pos_long_val < MIN_POS_TRAIN:
+            print(
+                "WARN_LOW_POS_VAL symbol={} side=long pos={} min={}".format(
+                    symbol, pos_long_val, MIN_POS_TRAIN
+                )
+            )
+        if pos_short_val < MIN_POS_TRAIN:
+            print(
+                "WARN_LOW_POS_VAL symbol={} side=short pos={} min={}".format(
+                    symbol, pos_short_val, MIN_POS_TRAIN
+                )
+            )
+        if pos_long_test < MIN_POS_TRAIN:
+            print(
+                "WARN_LOW_POS_TEST symbol={} side=long pos={} min={}".format(
+                    symbol, pos_long_test, MIN_POS_TRAIN
+                )
+            )
+        if pos_short_test < MIN_POS_TRAIN:
+            print(
+                "WARN_LOW_POS_TEST symbol={} side=short pos={} min={}".format(
+                    symbol, pos_short_test, MIN_POS_TRAIN
+                )
+            )
+        if not long_ready and not short_ready:
             continue
         if len(x_long_train) > TRAIN_LIMIT:
             x_long_train = x_long_train.iloc[-TRAIN_LIMIT:]
@@ -982,12 +1129,22 @@ def main() -> None:
                     max_iter=max_iter,
                     tol=tol,
                 )
-                x_long_train_clean = x_long_train.fillna(0.0)
-                x_short_train_clean = x_short_train.fillna(0.0)
+                x_long_train_clean = None
+                x_short_train_clean = None
+                if long_ready:
+                    x_long_train_clean = x_long_train.fillna(0.0)
+                else:
+                    model_long = None
+                if short_ready:
+                    x_short_train_clean = x_short_train.fillna(0.0)
+                else:
+                    model_short = None
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always", ConvergenceWarning)
-                    model_long.fit(x_long_train_clean, y_long_train)
-                    model_short.fit(x_short_train_clean, y_short_train)
+                    if model_long is not None:
+                        model_long.fit(x_long_train_clean, y_long_train)
+                    if model_short is not None:
+                        model_short.fit(x_short_train_clean, y_short_train)
                 has_convergence_warning = any(
                     isinstance(warning.message, ConvergenceWarning) for warning in caught
                 )
@@ -996,6 +1153,9 @@ def main() -> None:
                 out_pred_path = args.out_dir / "_sim" / f"{symbol}-sim.jsonl"
                 out_pred_path.parent.mkdir(parents=True, exist_ok=True)
                 best_trial = None
+                if model_long is None and model_short is None:
+                    continue
+                early_stop = False
                 for p_trade in p_trade_grid:
                     sim_summary = simulate_trade_only(
                         symbol,
@@ -1009,37 +1169,46 @@ def main() -> None:
                         horizon_bars=MAX_HORIZON_BARS,
                     )
                     winrate = sim_summary["winrate"]
-                    preds_per_day = sim_summary["predsPerDay"]
-                    preds = sim_summary["predCount"]
+                    trades_per_day = sim_summary["predsPerDay"]
+                    trades = sim_summary["predCount"]
                     days_span = sim_summary["daysSpan"]
                     print(
-                        "TUNE symbol={} trial={} model=LR params={} pTrade={} valWinrate={:.6f} preds={} days={} predsPerDay={:.6f}".format(
+                        "TUNE symbol={} trial={} model=LR params={} pTrade={} valWinrate={:.6f} valTrades={} valDays={} valTradesPerDay={:.6f}".format(
                             symbol,
                             trial_index,
                             params,
                             p_trade,
                             winrate,
-                            preds,
+                            trades,
                             days_span,
-                            preds_per_day,
+                            trades_per_day,
                         )
                     )
-                    valid = preds >= 500 and preds_per_day >= 7.0
+                    valid = trades >= MIN_TRADES_VAL and trades_per_day >= MIN_TRADE_PER_DAY
                     if not valid:
                         continue
-                    metric = (winrate, preds)
+                    metric = (winrate, trades_per_day, trades)
                     if best_trial is None or metric > best_trial["metric"]:
                         best_trial = {
                             "metric": metric,
                             "params": params,
                             "p_trade": p_trade,
                             "winrate": winrate,
-                            "preds": preds,
-                            "preds_per_day": preds_per_day,
+                            "preds": trades,
+                            "preds_per_day": trades_per_day,
                             "days": days_span,
                         }
+                    if (
+                        winrate >= TARGET_WINRATE
+                        and trades_per_day >= MIN_TRADE_PER_DAY
+                        and trades >= MIN_TRADES_VAL
+                    ):
+                        early_stop = True
+                        break
                 if best_trial and (best is None or best_trial["metric"] > best["metric"]):
                     best = {**best_trial, "model": "LR"}
+                if early_stop:
+                    break
         else:
             hgb_params = list(
                 itertools.product(
@@ -1048,28 +1217,39 @@ def main() -> None:
                     [4, 6, 8, 10],
                     [20, 50, 100, 200],
                     [0.0, 0.1, 0.5, 1.0],
+                    [None, "balanced"],
                 )
             )
             if not args.auto_tune:
-                hgb_params = [(200, 0.1, 6, 50, 0.1)]
+                hgb_params = [(200, 0.1, 6, 50, 0.1, None)]
             if args.max_trials:
                 hgb_params = hgb_params[: args.max_trials]
             for trial_index, params_raw in enumerate(hgb_params, start=1):
-                max_iter, learning_rate, max_depth, min_samples_leaf, l2_regularization = params_raw
+                max_iter, learning_rate, max_depth, min_samples_leaf, l2_regularization, class_weight = params_raw
                 params = {
                     "max_iter": max_iter,
                     "learning_rate": learning_rate,
                     "max_depth": max_depth,
                     "min_samples_leaf": min_samples_leaf,
                     "l2_regularization": l2_regularization,
+                    "class_weight": class_weight,
                 }
-                model_long = build_hgb_model(**params)
-                model_short = build_hgb_model(**params)
-                model_long.fit(x_long_train, y_long_train)
-                model_short.fit(x_short_train, y_short_train)
+                model_long = make_hgb(params)
+                model_short = make_hgb(params)
+                if long_ready:
+                    model_long = fit_hgb_time_series(model_long, x_long_train, y_long_train, x_long_val, y_long_val)
+                else:
+                    model_long = None
+                if short_ready:
+                    model_short = fit_hgb_time_series(model_short, x_short_train, y_short_train, x_short_val, y_short_val)
+                else:
+                    model_short = None
                 out_pred_path = args.out_dir / "_sim" / f"{symbol}-sim.jsonl"
                 out_pred_path.parent.mkdir(parents=True, exist_ok=True)
                 best_trial = None
+                if model_long is None and model_short is None:
+                    continue
+                early_stop = False
                 for p_trade in p_trade_grid:
                     sim_summary = simulate_trade_only(
                         symbol,
@@ -1083,37 +1263,46 @@ def main() -> None:
                         horizon_bars=MAX_HORIZON_BARS,
                     )
                     winrate = sim_summary["winrate"]
-                    preds_per_day = sim_summary["predsPerDay"]
-                    preds = sim_summary["predCount"]
+                    trades_per_day = sim_summary["predsPerDay"]
+                    trades = sim_summary["predCount"]
                     days_span = sim_summary["daysSpan"]
                     print(
-                        "TUNE symbol={} trial={} model=HGB params={} pTrade={} valWinrate={:.6f} preds={} days={} predsPerDay={:.6f}".format(
+                        "TUNE symbol={} trial={} model=HGB params={} pTrade={} valWinrate={:.6f} valTrades={} valDays={} valTradesPerDay={:.6f}".format(
                             symbol,
                             trial_index,
                             params,
                             p_trade,
                             winrate,
-                            preds,
+                            trades,
                             days_span,
-                            preds_per_day,
+                            trades_per_day,
                         )
                     )
-                    valid = preds >= 500 and preds_per_day >= 7.0
+                    valid = trades >= MIN_TRADES_VAL and trades_per_day >= MIN_TRADE_PER_DAY
                     if not valid:
                         continue
-                    metric = (winrate, preds)
+                    metric = (winrate, trades_per_day, trades)
                     if best_trial is None or metric > best_trial["metric"]:
                         best_trial = {
                             "metric": metric,
                             "params": params,
                             "p_trade": p_trade,
                             "winrate": winrate,
-                            "preds": preds,
-                            "preds_per_day": preds_per_day,
+                            "preds": trades,
+                            "preds_per_day": trades_per_day,
                             "days": days_span,
                         }
+                    if (
+                        winrate >= TARGET_WINRATE
+                        and trades_per_day >= MIN_TRADE_PER_DAY
+                        and trades >= MIN_TRADES_VAL
+                    ):
+                        early_stop = True
+                        break
                 if best_trial and (best is None or best_trial["metric"] > best["metric"]):
                     best = {**best_trial, "model": "HGB"}
+                if early_stop:
+                    break
         if best is None:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
             continue
@@ -1124,27 +1313,35 @@ def main() -> None:
         train_long_y = pd.concat([y_long_train, y_long_val], axis=0)
         train_short_y = pd.concat([y_short_train, y_short_val], axis=0)
         if best["model"] == "LR":
-            final_long = build_lr_pipeline(
-                best_params["solver"],
-                c_value=best_params["C"],
-                class_weight=best_params["class_weight"],
-                max_iter=best_params["max_iter"],
-                tol=best_params["tol"],
-            )
-            final_short = build_lr_pipeline(
-                best_params["solver"],
-                c_value=best_params["C"],
-                class_weight=best_params["class_weight"],
-                max_iter=best_params["max_iter"],
-                tol=best_params["tol"],
-            )
-            final_long.fit(train_long.fillna(0.0), train_long_y)
-            final_short.fit(train_short.fillna(0.0), train_short_y)
+            final_long = None
+            final_short = None
+            if long_ready:
+                final_long = build_lr_pipeline(
+                    best_params["solver"],
+                    c_value=best_params["C"],
+                    class_weight=best_params["class_weight"],
+                    max_iter=best_params["max_iter"],
+                    tol=best_params["tol"],
+                )
+                final_long.fit(train_long.fillna(0.0), train_long_y)
+            if short_ready:
+                final_short = build_lr_pipeline(
+                    best_params["solver"],
+                    c_value=best_params["C"],
+                    class_weight=best_params["class_weight"],
+                    max_iter=best_params["max_iter"],
+                    tol=best_params["tol"],
+                )
+                final_short.fit(train_short.fillna(0.0), train_short_y)
         else:
-            final_long = build_hgb_model(**best_params)
-            final_short = build_hgb_model(**best_params)
-            final_long.fit(train_long, train_long_y)
-            final_short.fit(train_short, train_short_y)
+            final_long = None
+            final_short = None
+            if long_ready:
+                final_long = make_hgb(best_params)
+                final_long = fit_hgb_time_series(final_long, train_long, train_long_y, x_long_val, y_long_val)
+            if short_ready:
+                final_short = make_hgb(best_params)
+                final_short = fit_hgb_time_series(final_short, train_short, train_short_y, x_short_val, y_short_val)
         val_sim_path = args.out_dir / symbol / "sim_val.jsonl"
         val_summary = simulate_trade_only(
             symbol,
@@ -1170,7 +1367,7 @@ def main() -> None:
             horizon_bars=MAX_HORIZON_BARS,
         )
         print(
-            "FINAL symbol={} model={} bestParams={} pTradeSelected={} testWinrate={:.6f} testPreds={} testDays={} testPredsPerDay={:.6f}".format(
+            "FINAL symbol={} model={} bestParams={} pTradeSelected={} testWinrate={:.6f} testTrades={} testDays={} testTradesPerDay={:.6f}".format(
                 symbol,
                 best["model"],
                 best_params,
@@ -1206,6 +1403,40 @@ def main() -> None:
                 len(x_short_test),
             ),
         ):
+            if model is None:
+                model_dir = args.out_dir / symbol / f"{model_version}_{side}"
+                write_meta(
+                    model_dir / "model_meta.json",
+                    best["model"],
+                    model_version,
+                    symbol,
+                    train_days,
+                    len(train_long),
+                    [],
+                    0,
+                    feature_order,
+                    [],
+                    None,
+                    label_type,
+                    selected_p_trade,
+                    best_params,
+                    val_summary["winrate"],
+                    0.0,
+                    val_summary["predCount"],
+                    val_summary["predsPerDay"],
+                    val_summary["daysSpan"],
+                    val_count,
+                    test_summary["winrate"],
+                    0.0,
+                    test_summary["predCount"],
+                    test_summary["predsPerDay"],
+                    test_summary["daysSpan"],
+                    test_count,
+                    False,
+                    False,
+                )
+                print("MODEL_SKIPPED symbol={} side={} reason=not_trained".format(symbol, side))
+                continue
             model_dir = args.out_dir / symbol / f"{model_version}_{side}"
             try:
                 input_names, output_names = export_onnx(model, len(feature_order), model_dir / "model.onnx")
@@ -1216,6 +1447,36 @@ def main() -> None:
                 )
             except Exception as exc:
                 print("ONNX_EXPORT_FAIL symbol={} side={} err={}".format(symbol, side, exc))
+                write_meta(
+                    model_dir / "model_meta.json",
+                    best["model"],
+                    model_version,
+                    symbol,
+                    train_days,
+                    len(train_long),
+                    [int(value) for value in list(model.classes_)],
+                    0,
+                    feature_order,
+                    [],
+                    None,
+                    label_type,
+                    selected_p_trade,
+                    best_params,
+                    val_summary["winrate"],
+                    0.0,
+                    val_summary["predCount"],
+                    val_summary["predsPerDay"],
+                    val_summary["daysSpan"],
+                    val_count,
+                    test_summary["winrate"],
+                    0.0,
+                    test_summary["predCount"],
+                    test_summary["predsPerDay"],
+                    test_summary["daysSpan"],
+                    test_count,
+                    False,
+                    False,
+                )
                 continue
             prob_output_name = "probabilities" if "probabilities" in output_names else None
             x_check = train_long.iloc[:256].to_numpy(dtype=np.float32)
@@ -1256,6 +1517,7 @@ def main() -> None:
                 test_summary["daysSpan"],
                 test_count,
                 False,
+                True,
             )
             write_current(model_dir, args.out_dir, symbol, side)
             print(
