@@ -14,22 +14,21 @@ import org.springframework.stereotype.Component;
 public class OnnxInferenceService {
     private static final Logger log = LoggerFactory.getLogger(OnnxInferenceService.class);
 
-    public Optional<Double> predict(FeatureRecord record, OnnxModelLoader.ModelBundle model) throws OrtException {
-        if (model == null || model.getSession() == null || model.getMeta() == null) {
+    public Optional<Double> predict(FeatureRecord record, OrtSession session, ModelMeta meta)
+            throws OrtException {
+        if (session == null || meta == null) {
             return Optional.empty();
         }
-        ModelMeta meta = model.getMeta();
-        List<String> order = meta.getFeatureOrder();
-        if (order == null || order.isEmpty()) {
+        if (meta.getFeatureOrder() == null || meta.getFeatureOrder().isEmpty()) {
             return Optional.empty();
         }
-        float[] inputs = buildInputs(record, order);
-        String inputName = model.getSession().getInputNames().iterator().next();
+        float[] inputs = buildInputs(record, meta.getFeatureOrder());
+        String inputName = session.getInputNames().iterator().next();
         try (OnnxTensor tensor = OnnxTensor.createTensor(OrtEnvironment.getEnvironment(),
                 FloatBuffer.wrap(inputs),
                 new long[] {1, inputs.length});
-             OrtSession.Result result = model.getSession().run(Map.of(inputName, tensor))) {
-            String probOutput = resolveProbOutputName(meta, model);
+             OrtSession.Result result = session.run(Map.of(inputName, tensor))) {
+            String probOutput = resolveProbOutputName(meta, session);
             return Optional.of(extractProbability(result, probOutput, meta.getUpClassIndex()));
         }
     }
@@ -68,14 +67,18 @@ public class OnnxInferenceService {
         };
     }
 
-    private String resolveProbOutputName(ModelMeta meta, OnnxModelLoader.ModelBundle model) {
-        if (meta.getProbOutputName() != null && model.getSession().getOutputNames().contains(meta.getProbOutputName())) {
-            return meta.getProbOutputName();
-        }
-        if (model.getSession().getOutputNames().contains("probabilities")) {
+    private String resolveProbOutputName(OrtSession session) {
+        if (session.getOutputNames().contains("probabilities")) {
             return "probabilities";
         }
-        return model.getSession().getOutputNames().iterator().next();
+        return session.getOutputNames().iterator().next();
+    }
+
+    private String resolveProbOutputName(ModelMeta meta, OrtSession session) {
+        if (meta.getProbOutputName() != null && session.getOutputNames().contains(meta.getProbOutputName())) {
+            return meta.getProbOutputName();
+        }
+        return resolveProbOutputName(session);
     }
 
     private double extractProbability(OrtSession.Result result, String outputName, Integer upClassIndex)
