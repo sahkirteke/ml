@@ -286,10 +286,10 @@ def build_labels_from_raw(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
             record = dict(base_record)
             record.update(
                 {
-                    "labelType": "tp0_004_sl0_002_within_7_event_driven_LONG",
                     "labelHit": int(label_hit),
                     "timeToEvent": int(time_to_event),
                     "event": event,
+                    "side": "LONG",
                 }
             )
             long_records.append(record)
@@ -298,10 +298,10 @@ def build_labels_from_raw(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
             record = dict(base_record)
             record.update(
                 {
-                    "labelType": "tp0_004_sl0_002_within_7_event_driven_SHORT",
                     "labelHit": int(label_hit),
                     "timeToEvent": int(time_to_event),
                     "event": event,
+                    "side": "SHORT",
                 }
             )
             short_records.append(record)
@@ -315,46 +315,21 @@ def build_training_frames(
     tuple[pd.DataFrame, pd.Series, np.ndarray],
     list[str],
 ]:
-    features_filtered = features[(features["windowReady"] == True) & (features["featuresVersion"] == FEATURES_VERSION)]
-    if features_filtered.empty:
+    features_window = features[(features["windowReady"] == True) & (features["featuresVersion"] == FEATURES_VERSION)]
+    if features_window.empty:
         raise RuntimeError("No rows available after filtering features")
     if raw.empty:
         raise RuntimeError("Raw data required for label generation is empty")
     long_labels, short_labels = build_labels_from_raw(raw)
     if long_labels.empty and short_labels.empty:
         raise RuntimeError("No rows available after labeling")
-    def ensure_symbol_tf(labels: pd.DataFrame) -> pd.DataFrame:
-        if labels.empty:
-            return labels
-        if "symbol" not in labels.columns:
-            if "symbol" in features_filtered.columns and features_filtered["symbol"].nunique() == 1:
-                labels = labels.copy()
-                labels["symbol"] = features_filtered["symbol"].iloc[0]
-            else:
-                raise RuntimeError("Label data missing symbol for join")
-        if "tf" not in labels.columns:
-            if "tf" in features_filtered.columns and features_filtered["tf"].nunique() == 1:
-                labels = labels.copy()
-                labels["tf"] = features_filtered["tf"].iloc[0]
-            else:
-                raise RuntimeError("Label data missing tf for join")
-        return labels
-
-    long_labels = ensure_symbol_tf(long_labels)
-    short_labels = ensure_symbol_tf(short_labels)
-    merged_long = features_filtered.merge(
-        long_labels,
-        on=["symbol", "tf", "closeTimeMs"],
-        how="inner",
-    ).sort_values("closeTimeMs").reset_index(drop=True)
-    merged_short = features_filtered.merge(
-        short_labels,
-        on=["symbol", "tf", "closeTimeMs"],
-        how="inner",
-    ).sort_values("closeTimeMs").reset_index(drop=True)
-    if merged_long.empty and merged_short.empty:
+    long_labels = long_labels[["closeTimeMs", "labelHit"]].copy()
+    short_labels = short_labels[["closeTimeMs", "labelHit"]].copy()
+    frame_long = features_window.merge(long_labels, on="closeTimeMs", how="inner")
+    frame_short = features_window.merge(short_labels, on="closeTimeMs", how="inner")
+    if frame_long.empty and frame_short.empty:
         raise RuntimeError("No rows available after joining features and labels")
-    missing_features = [col for col in FEATURE_ORDER if col not in features_filtered.columns]
+    missing_features = [col for col in FEATURE_ORDER if col not in features_window.columns]
     if missing_features:
         raise RuntimeError(f"Missing expected feature columns: {missing_features}")
 
@@ -373,8 +348,8 @@ def build_training_frames(
         close_times = pd.to_numeric(merged["closeTimeMs"], errors="coerce").to_numpy(dtype=np.float64)
         return x, y, close_times
 
-    x_long, y_long, close_long = build_xy(merged_long)
-    x_short, y_short, close_short = build_xy(merged_short)
+    x_long, y_long, close_long = build_xy(frame_long)
+    x_short, y_short, close_short = build_xy(frame_short)
     feature_order = list(x_long.columns if not x_long.empty else x_short.columns)
     return (x_long, y_long, close_long), (x_short, y_short, close_short), feature_order
 
@@ -764,8 +739,12 @@ def main() -> None:
                 long_labels, short_labels = build_labels_from_raw(raw)
                 label_rows = len(long_labels) + len(short_labels)
             except RuntimeError:
+                long_labels = pd.DataFrame()
+                short_labels = pd.DataFrame()
                 label_rows = 0
         else:
+            long_labels = pd.DataFrame()
+            short_labels = pd.DataFrame()
             label_rows = 0
         print(
             "FRAME_COUNTS symbol={} raw={} feat={} joined={} windowReady={} labels={}".format(
@@ -777,6 +756,13 @@ def main() -> None:
                 label_rows,
             )
         )
+        print(
+            "LABEL_COUNTS symbol={} longLabels={} shortLabels={}".format(
+                symbol,
+                len(long_labels),
+                len(short_labels),
+            )
+        )
         if args.test_rows <= 0 or args.val_rows <= 0:
             raise RuntimeError("--test-rows and --val-rows must be > 0")
         if features.empty:
@@ -784,6 +770,35 @@ def main() -> None:
             continue
         if features_filtered.empty:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
+        frame_long = pd.DataFrame()
+        frame_short = pd.DataFrame()
+        if not long_labels.empty:
+            frame_long = features_filtered.merge(
+                long_labels[["closeTimeMs", "labelHit"]],
+                on="closeTimeMs",
+                how="inner",
+            )
+        if not short_labels.empty:
+            frame_short = features_filtered.merge(
+                short_labels[["closeTimeMs", "labelHit"]],
+                on="closeTimeMs",
+                how="inner",
+            )
+        print(
+            "TRAIN_FRAME_COUNTS symbol={} longRows={} shortRows={}".format(
+                symbol,
+                len(frame_long),
+                len(frame_short),
+            )
+        )
+        if len(frame_long) == 0:
+            print("EMPTY_TRAIN_FRAME symbol={} side=LONG reason=missing_label_column_or_filter".format(symbol))
+            print("EMPTY_TRAIN_FRAME_COLUMNS symbol={} side=LONG columns={}".format(symbol, list(frame_long.columns)))
+        if len(frame_short) == 0:
+            print("EMPTY_TRAIN_FRAME symbol={} side=SHORT reason=missing_label_column_or_filter".format(symbol))
+            print("EMPTY_TRAIN_FRAME_COLUMNS symbol={} side=SHORT columns={}".format(symbol, list(frame_short.columns)))
+        if len(frame_long) == 0 or len(frame_short) == 0:
             continue
         close_times = features_filtered["closeTimeMs"].sort_values().to_numpy()
         if len(close_times) <= args.test_rows + args.val_rows:
@@ -813,7 +828,12 @@ def main() -> None:
         x_long, y_long, close_long = long_data
         x_short, y_short, close_short = short_data
         if x_long.empty or x_short.empty:
-            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            if x_long.empty:
+                print("EMPTY_TRAIN_FRAME symbol={} side=LONG reason=missing_label_column_or_filter".format(symbol))
+                print("EMPTY_TRAIN_FRAME_COLUMNS symbol={} side=LONG columns={}".format(symbol, list(frame_long.columns)))
+            if x_short.empty:
+                print("EMPTY_TRAIN_FRAME symbol={} side=SHORT reason=missing_label_column_or_filter".format(symbol))
+                print("EMPTY_TRAIN_FRAME_COLUMNS symbol={} side=SHORT columns={}".format(symbol, list(frame_short.columns)))
             continue
         train_mask_long = close_long < train_end_ms
         val_mask_long = (close_long >= val_start_ms) & (close_long < val_end_ms)
@@ -833,8 +853,19 @@ def main() -> None:
         y_long_test = y_long.loc[test_mask_long]
         x_short_test = x_short.loc[test_mask_short]
         y_short_test = y_short.loc[test_mask_short]
-        if len(x_long_train) < args.min_rows_per_symbol or len(x_short_train) < args.min_rows_per_symbol:
-            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+        if len(x_long_train) < args.min_rows_per_symbol:
+            print(
+                "SKIP_LONG_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
+                    symbol, len(x_long_train), args.min_rows_per_symbol
+                )
+            )
+            continue
+        if len(x_short_train) < args.min_rows_per_symbol:
+            print(
+                "SKIP_SHORT_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
+                    symbol, len(x_short_train), args.min_rows_per_symbol
+                )
+            )
             continue
         if len(x_long_val) == 0 or len(x_short_val) == 0 or len(x_long_test) == 0 or len(x_short_test) == 0:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
