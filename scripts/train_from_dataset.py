@@ -414,7 +414,7 @@ def simulate_trade_only(
             "predsPerDay": 0.0,
         }
     feature_cols = [col for col in FEATURE_ORDER if col in joined.columns]
-    x_vals = joined[feature_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
+    x_vals = joined[feature_cols].apply(pd.to_numeric, errors="coerce").astype(np.float32)
     prob_long = model_long.predict_proba(x_vals) if model_long is not None else None
     prob_short = model_short.predict_proba(x_vals) if model_short is not None else None
     if prob_long is None and prob_short is None:
@@ -748,13 +748,6 @@ def main() -> None:
             fast_tail=args.fast_tail,
             need_rows=need_rows,
         )
-        if features.empty:
-            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
-            continue
-        features_filtered = features[(features["windowReady"] == True) & (features["featuresVersion"] == FEATURES_VERSION)]
-        if features_filtered.empty:
-            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
-            continue
         raw, _ = load_raw_frames(
             args.data_dir,
             symbol,
@@ -762,8 +755,36 @@ def main() -> None:
             fast_tail=args.fast_tail,
             need_rows=need_rows,
         )
+        features_filtered = features[(features["windowReady"] == True) & (features["featuresVersion"] == FEATURES_VERSION)]
+        joined_rows = 0
+        if not features.empty and not raw.empty and "closeTimeMs" in features.columns and "closeTimeMs" in raw.columns:
+            joined_rows = len(features.merge(raw[["closeTimeMs"]], on="closeTimeMs", how="inner"))
+        if not raw.empty:
+            try:
+                long_labels, short_labels = build_labels_from_raw(raw)
+                label_rows = len(long_labels) + len(short_labels)
+            except RuntimeError:
+                label_rows = 0
+        else:
+            label_rows = 0
+        print(
+            "FRAME_COUNTS symbol={} raw={} feat={} joined={} windowReady={} labels={}".format(
+                symbol,
+                len(raw),
+                len(features),
+                joined_rows,
+                len(features_filtered),
+                label_rows,
+            )
+        )
         if args.test_rows <= 0 or args.val_rows <= 0:
             raise RuntimeError("--test-rows and --val-rows must be > 0")
+        if features.empty:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
+        if features_filtered.empty:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
         close_times = features_filtered["closeTimeMs"].sort_values().to_numpy()
         if len(close_times) <= args.test_rows + args.val_rows:
             print(
@@ -870,20 +891,19 @@ def main() -> None:
             )
             if has_convergence_warning:
                 print("WARN_CONVERGENCE symbol={} params={}".format(symbol, params))
-            import tempfile
-
-            with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=True) as tmp_file:
-                sim_summary = simulate_trade_only(
-                    symbol,
-                    val_raw,
-                    val_feat,
-                    model_long,
-                    model_short,
-                    Path(tmp_file.name),
-                    conf_thr=CONF_THRESHOLD,
-                    p_trade=P_TRADE,
-                    horizon_bars=MAX_HORIZON_BARS,
-                )
+            out_pred_path = args.out_dir / "_sim" / f"{symbol}-sim.jsonl"
+            out_pred_path.parent.mkdir(parents=True, exist_ok=True)
+            sim_summary = simulate_trade_only(
+                symbol,
+                val_raw,
+                val_feat,
+                model_long,
+                model_short,
+                out_pred_path,
+                conf_thr=CONF_THRESHOLD,
+                p_trade=P_TRADE,
+                horizon_bars=MAX_HORIZON_BARS,
+            )
             winrate = sim_summary["winrate"]
             preds_per_day = sim_summary["predsPerDay"]
             preds = sim_summary["predCount"]
