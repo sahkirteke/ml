@@ -65,6 +65,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default=Path("models"), type=Path, help="Output models directory")
     parser.add_argument("--exclude-today", action="store_true", help="Exclude today's partition (Europe/Istanbul)")
     parser.add_argument("--symbols", default=None, help="Comma-separated symbols to include")
+    parser.add_argument("--seed", default=42, type=int, help="Random seed for trial shuffling")
+    parser.add_argument("--p-trade-min", default=0.25, type=float, help="Minimum pTrade for tuning grid")
+    parser.add_argument("--p-trade-max", default=0.70, type=float, help="Maximum pTrade for tuning grid")
+    parser.add_argument("--p-trade-step", default=0.02, type=float, help="Step size for pTrade grid")
+    parser.add_argument(
+        "--p-gap-grid",
+        default="0.00,0.02,0.05",
+        help="Comma-separated pGap grid for confidence gap filter",
+    )
     parser.add_argument("--min-rows-per-symbol", default=MIN_TRAIN_ROWS, type=int, help="Minimum rows required to train")
     parser.add_argument("--train-rows", default=None, type=int, help="Rows to use for training (most recent)")
     parser.add_argument("--test-rows", default=100000, type=int, help="Rows to hold out for evaluation")
@@ -371,7 +380,9 @@ def simulate_trade_only(
     *,
     conf_thr: float = CONF_THRESHOLD,
     p_trade: float = P_TRADE,
+    p_gap: float = 0.0,
     horizon_bars: int = MAX_HORIZON_BARS,
+    write_preds: bool = True,
 ) -> dict:
     raw_sorted = raw_df.sort_values("closeTimeMs").copy()
     feat_sorted = feat_df.sort_values("closeTimeMs").copy()
@@ -413,9 +424,11 @@ def simulate_trade_only(
     nok_count = 0
     bars_to_event: list[int] = []
     pending: dict[str, object] | None = None
-    out_pred_path.parent.mkdir(parents=True, exist_ok=True)
+    if write_preds:
+        out_pred_path.parent.mkdir(parents=True, exist_ok=True)
     prev_close_time = None
-    with out_pred_path.open("w", encoding="utf-8") as handle:
+    handle = out_pred_path.open("w", encoding="utf-8") if write_preds else None
+    try:
         for idx, row in joined.iterrows():
             close_time = int(row["closeTimeMs"])
             if prev_close_time is not None and close_time - prev_close_time != GAP_MS:
@@ -457,7 +470,8 @@ def simulate_trade_only(
                         "tpPrice": pending["tpPrice"],
                         "slPrice": pending["slPrice"],
                     }
-                    handle.write(json.dumps(eval_record, ensure_ascii=False) + "\n")
+                    if handle is not None:
+                        handle.write(json.dumps(eval_record, ensure_ascii=False) + "\n")
                     eval_count += 1
                     if result == "OK":
                         ok_count += 1
@@ -481,11 +495,20 @@ def simulate_trade_only(
                 p_short_hit = 0.0
             if model_short is None:
                 p_hit = p_long_hit
+                other_prob = 0.0
                 direction = "UP" if p_hit >= 0.5 else "DOWN"
             else:
-                p_hit = max(p_long_hit, p_short_hit)
-                direction = "UP" if p_long_hit >= p_short_hit else "DOWN"
+                if p_long_hit >= p_short_hit:
+                    p_hit = p_long_hit
+                    other_prob = p_short_hit
+                    direction = "UP"
+                else:
+                    p_hit = p_short_hit
+                    other_prob = p_long_hit
+                    direction = "DOWN"
             if p_hit < p_trade:
+                continue
+            if p_hit - other_prob < p_gap:
                 continue
             tp_price = close * (1.0 + TP_PCT) if direction == "UP" else close * (1.0 - TP_PCT)
             sl_price = close * (1.0 - SL_PCT) if direction == "UP" else close * (1.0 + SL_PCT)
@@ -506,7 +529,8 @@ def simulate_trade_only(
                 "pTrade": p_trade,
                 "confidence": max(p_hit, 1.0 - p_hit),
             }
-            handle.write(json.dumps(pred_record, ensure_ascii=False) + "\n")
+            if handle is not None:
+                handle.write(json.dumps(pred_record, ensure_ascii=False) + "\n")
             pred_count += 1
             pending = {
                 "predCloseTimeMs": close_time,
@@ -516,6 +540,9 @@ def simulate_trade_only(
                 "slPrice": sl_price,
                 "barsLeft": horizon_bars,
             }
+    finally:
+        if handle is not None:
+            handle.close()
     days_span = 0
     if not raw_sorted.empty:
         start_ms = int(raw_sorted["closeTimeMs"].min())
@@ -623,6 +650,91 @@ def fit_hgb_time_series(
     return model
 
 
+def build_eval_frame(feat_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
+    raw_sorted = raw_df.sort_values("closeTimeMs").copy()
+    feat_sorted = feat_df.sort_values("closeTimeMs").copy()
+    raw_sorted["close"] = pd.to_numeric(raw_sorted["closePrice"], errors="coerce")
+    raw_sorted["high"] = pd.to_numeric(raw_sorted["highPrice"], errors="coerce")
+    raw_sorted["low"] = pd.to_numeric(raw_sorted["lowPrice"], errors="coerce")
+    joined = feat_sorted.merge(
+        raw_sorted[["closeTimeMs", "close", "high", "low"]],
+        on="closeTimeMs",
+        how="inner",
+    )
+    joined = joined[joined["windowReady"] == True].copy()
+    return joined
+
+
+def prepare_feature_frame(joined: pd.DataFrame) -> pd.DataFrame:
+    feature_cols = [col for col in FEATURE_ORDER if col in joined.columns]
+    x_vals = joined[feature_cols].apply(pd.to_numeric, errors="coerce")
+    x_vals.replace([np.inf, -np.inf], np.nan, inplace=True)
+    return x_vals.astype(np.float32)
+
+
+def compute_probabilities(
+    model_long,
+    model_short,
+    x_vals: pd.DataFrame,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray]:
+    p_long = None
+    p_short = None
+    if model_long is not None:
+        if isinstance(model_long, LogisticRegression):
+            p_long = model_long.predict_proba(x_vals.fillna(0.0))[:, 1]
+        else:
+            p_long = model_long.predict_proba(x_vals)[:, 1]
+    if model_short is not None:
+        if isinstance(model_short, LogisticRegression):
+            p_short = model_short.predict_proba(x_vals.fillna(0.0))[:, 1]
+        else:
+            p_short = model_short.predict_proba(x_vals)[:, 1]
+    if p_long is None and p_short is None:
+        return None, None, np.array([])
+    if p_long is None:
+        best_prob = p_short
+    elif p_short is None:
+        best_prob = p_long
+    else:
+        best_prob = np.maximum(p_long, p_short)
+    return p_long, p_short, best_prob
+
+
+def build_p_trade_candidates(best_prob: np.ndarray, args: argparse.Namespace) -> list[float]:
+    grid = list(np.arange(args.p_trade_min, args.p_trade_max + 1e-9, args.p_trade_step))
+    quantiles = [0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.975, 0.99]
+    values = list(grid)
+    if best_prob.size:
+        for q in quantiles:
+            values.append(round(float(np.quantile(best_prob, q)), 3))
+    candidates = sorted({min(0.99, max(0.01, round(float(v), 3))) for v in values})
+    return candidates
+
+
+def log_prob_stats(symbol: str, side: str, probs: np.ndarray) -> None:
+    if probs.size == 0:
+        print(f"PROB_STATS symbol={symbol} side={side} empty=true")
+        return
+    p50 = float(np.quantile(probs, 0.50))
+    p90 = float(np.quantile(probs, 0.90))
+    p95 = float(np.quantile(probs, 0.95))
+    p99 = float(np.quantile(probs, 0.99))
+    thresholds = [0.40, 0.45, 0.50, 0.55, 0.60]
+    counts = {thr: int(np.sum(probs >= thr)) for thr in thresholds}
+    counts_str = " ".join([f"ge{int(thr*100)}={counts[thr]}" for thr in thresholds])
+    print(
+        "PROB_STATS symbol={} side={} p50={:.4f} p90={:.4f} p95={:.4f} p99={:.4f} {}".format(
+            symbol,
+            side,
+            p50,
+            p90,
+            p95,
+            p99,
+            counts_str,
+        )
+    )
+
+
 def export_onnx(model, feature_count: int, output_path: Path) -> tuple[list[str], list[str]]:
     initial_type = [("input", FloatTensorType([None, feature_count]))]
     onnx_model = convert_sklearn(
@@ -667,6 +779,8 @@ def write_meta(
     test_rows: int,
     export_fallback: bool,
     trained: bool,
+    p_gap_selected: float,
+    constraints_relaxed: bool,
 ) -> None:
     def _json_default(o):
         if isinstance(o, np.integer):
@@ -699,6 +813,8 @@ def write_meta(
         "maxHorizonBars": MAX_HORIZON_BARS,
         "horizonBars": MAX_HORIZON_BARS,
         "pTradeSelected": p_trade_selected,
+        "pGapSelected": p_gap_selected,
+        "constraintsRelaxed": constraints_relaxed,
         "classes": classes,
         "upClassIndex": up_class_index,
         "bestParams": best_params,
@@ -783,6 +899,8 @@ def main() -> None:
         if not features_root.exists():
             raise RuntimeError(f"No features directory found at {features_root}")
         symbols = sorted([path.name.upper() for path in features_root.iterdir() if path.is_dir()])
+    p_gap_grid = [float(value) for value in args.p_gap_grid.split(",") if value.strip()]
+    rng = np.random.default_rng(args.seed)
     for symbol in symbols:
         max_train_rows = args.train_rows or TRAIN_LIMIT
         need_rows = max_train_rows + args.val_rows + args.test_rows + MAX_HORIZON_BARS + 1
@@ -1091,7 +1209,7 @@ def main() -> None:
             x_short_train = x_short_train.iloc[-TRAIN_LIMIT:]
             y_short_train = y_short_train.iloc[-TRAIN_LIMIT:]
         best = None
-        p_trade_grid = [round(value, 2) for value in np.arange(0.5, 0.95, 0.05)]
+        constraints_relaxed = False
         if args.model == "LR":
             lr_params = list(
                 itertools.product(
@@ -1102,6 +1220,7 @@ def main() -> None:
                     [1e-4, 1e-3],
                 )
             )
+            rng.shuffle(lr_params)
             if not args.auto_tune:
                 lr_params = [(1.0, None, "lbfgs", 4000, 1e-4)]
             if args.max_trials:
@@ -1155,58 +1274,94 @@ def main() -> None:
                 best_trial = None
                 if model_long is None and model_short is None:
                     continue
+                val_joined = build_eval_frame(val_feat, val_raw)
+                x_val_eval = prepare_feature_frame(val_joined)
+                p_long, p_short, best_prob = compute_probabilities(model_long, model_short, x_val_eval)
+                log_prob_stats(symbol, "best", best_prob)
+                if p_long is not None:
+                    log_prob_stats(symbol, "long", p_long)
+                if p_short is not None:
+                    log_prob_stats(symbol, "short", p_short)
+                p_trade_candidates = build_p_trade_candidates(best_prob, args)
+                fallback_best = None
                 early_stop = False
-                for p_trade in p_trade_grid:
-                    sim_summary = simulate_trade_only(
-                        symbol,
-                        val_raw,
-                        val_feat,
-                        model_long,
-                        model_short,
-                        out_pred_path,
-                        conf_thr=CONF_THRESHOLD,
-                        p_trade=p_trade,
-                        horizon_bars=MAX_HORIZON_BARS,
-                    )
-                    winrate = sim_summary["winrate"]
-                    trades_per_day = sim_summary["predsPerDay"]
-                    trades = sim_summary["predCount"]
-                    days_span = sim_summary["daysSpan"]
-                    print(
-                        "TUNE symbol={} trial={} model=LR params={} pTrade={} valWinrate={:.6f} valTrades={} valDays={} valTradesPerDay={:.6f}".format(
+                for p_gap in p_gap_grid:
+                    for p_trade in p_trade_candidates:
+                        sim_summary = simulate_trade_only(
                             symbol,
-                            trial_index,
-                            params,
-                            p_trade,
-                            winrate,
-                            trades,
-                            days_span,
-                            trades_per_day,
+                            val_raw,
+                            val_feat,
+                            model_long,
+                            model_short,
+                            out_pred_path,
+                            conf_thr=CONF_THRESHOLD,
+                            p_trade=p_trade,
+                            p_gap=p_gap,
+                            horizon_bars=MAX_HORIZON_BARS,
+                            write_preds=False,
                         )
-                    )
-                    valid = trades >= MIN_TRADES_VAL and trades_per_day >= MIN_TRADE_PER_DAY
-                    if not valid:
-                        continue
-                    metric = (winrate, trades_per_day, trades)
-                    if best_trial is None or metric > best_trial["metric"]:
-                        best_trial = {
-                            "metric": metric,
-                            "params": params,
-                            "p_trade": p_trade,
-                            "winrate": winrate,
-                            "preds": trades,
-                            "preds_per_day": trades_per_day,
-                            "days": days_span,
-                        }
-                    if (
-                        winrate >= TARGET_WINRATE
-                        and trades_per_day >= MIN_TRADE_PER_DAY
-                        and trades >= MIN_TRADES_VAL
-                    ):
-                        early_stop = True
+                        winrate = sim_summary["winrate"]
+                        trades_per_day = sim_summary["predsPerDay"]
+                        trades = sim_summary["predCount"]
+                        days_span = sim_summary["daysSpan"]
+                        print(
+                            "TUNE symbol={} trial={} model=LR params={} pTrade={} pGap={} valWinrate={:.6f} valTrades={} valDays={} valTradesPerDay={:.6f}".format(
+                                symbol,
+                                trial_index,
+                                params,
+                                p_trade,
+                                p_gap,
+                                winrate,
+                                trades,
+                                days_span,
+                                trades_per_day,
+                            )
+                        )
+                        valid = trades >= MIN_TRADES_VAL and trades_per_day >= MIN_TRADE_PER_DAY
+                        if not valid:
+                            soft_valid = trades >= 200 and trades_per_day >= MIN_TRADE_PER_DAY
+                            if soft_valid:
+                                metric = (winrate, trades_per_day, trades)
+                                if fallback_best is None or metric > fallback_best["metric"]:
+                                    fallback_best = {
+                                        "metric": metric,
+                                        "params": params,
+                                        "p_trade": p_trade,
+                                        "p_gap": p_gap,
+                                        "winrate": winrate,
+                                        "preds": trades,
+                                        "preds_per_day": trades_per_day,
+                                        "days": days_span,
+                                    }
+                            continue
+                        metric = (winrate, trades_per_day, trades)
+                        if best_trial is None or metric > best_trial["metric"]:
+                            best_trial = {
+                                "metric": metric,
+                                "params": params,
+                                "p_trade": p_trade,
+                                "p_gap": p_gap,
+                                "winrate": winrate,
+                                "preds": trades,
+                                "preds_per_day": trades_per_day,
+                                "days": days_span,
+                            }
+                        if (
+                            winrate >= TARGET_WINRATE
+                            and trades_per_day >= MIN_TRADE_PER_DAY
+                            and trades >= MIN_TRADES_VAL
+                        ):
+                            early_stop = True
+                            break
+                    if early_stop:
                         break
                 if best_trial and (best is None or best_trial["metric"] > best["metric"]):
                     best = {**best_trial, "model": "LR"}
+                    constraints_relaxed = False
+                elif best_trial is None and fallback_best is not None and best is None:
+                    print("WARN_CONSTRAINTS_RELAXED symbol={} model=LR".format(symbol))
+                    best = {**fallback_best, "model": "LR"}
+                    constraints_relaxed = True
                 if early_stop:
                     break
         else:
@@ -1220,6 +1375,7 @@ def main() -> None:
                     [None, "balanced"],
                 )
             )
+            rng.shuffle(hgb_params)
             if not args.auto_tune:
                 hgb_params = [(200, 0.1, 6, 50, 0.1, None)]
             if args.max_trials:
@@ -1249,58 +1405,94 @@ def main() -> None:
                 best_trial = None
                 if model_long is None and model_short is None:
                     continue
+                val_joined = build_eval_frame(val_feat, val_raw)
+                x_val_eval = prepare_feature_frame(val_joined)
+                p_long, p_short, best_prob = compute_probabilities(model_long, model_short, x_val_eval)
+                log_prob_stats(symbol, "best", best_prob)
+                if p_long is not None:
+                    log_prob_stats(symbol, "long", p_long)
+                if p_short is not None:
+                    log_prob_stats(symbol, "short", p_short)
+                p_trade_candidates = build_p_trade_candidates(best_prob, args)
+                fallback_best = None
                 early_stop = False
-                for p_trade in p_trade_grid:
-                    sim_summary = simulate_trade_only(
-                        symbol,
-                        val_raw,
-                        val_feat,
-                        model_long,
-                        model_short,
-                        out_pred_path,
-                        conf_thr=CONF_THRESHOLD,
-                        p_trade=p_trade,
-                        horizon_bars=MAX_HORIZON_BARS,
-                    )
-                    winrate = sim_summary["winrate"]
-                    trades_per_day = sim_summary["predsPerDay"]
-                    trades = sim_summary["predCount"]
-                    days_span = sim_summary["daysSpan"]
-                    print(
-                        "TUNE symbol={} trial={} model=HGB params={} pTrade={} valWinrate={:.6f} valTrades={} valDays={} valTradesPerDay={:.6f}".format(
+                for p_gap in p_gap_grid:
+                    for p_trade in p_trade_candidates:
+                        sim_summary = simulate_trade_only(
                             symbol,
-                            trial_index,
-                            params,
-                            p_trade,
-                            winrate,
-                            trades,
-                            days_span,
-                            trades_per_day,
+                            val_raw,
+                            val_feat,
+                            model_long,
+                            model_short,
+                            out_pred_path,
+                            conf_thr=CONF_THRESHOLD,
+                            p_trade=p_trade,
+                            p_gap=p_gap,
+                            horizon_bars=MAX_HORIZON_BARS,
+                            write_preds=False,
                         )
-                    )
-                    valid = trades >= MIN_TRADES_VAL and trades_per_day >= MIN_TRADE_PER_DAY
-                    if not valid:
-                        continue
-                    metric = (winrate, trades_per_day, trades)
-                    if best_trial is None or metric > best_trial["metric"]:
-                        best_trial = {
-                            "metric": metric,
-                            "params": params,
-                            "p_trade": p_trade,
-                            "winrate": winrate,
-                            "preds": trades,
-                            "preds_per_day": trades_per_day,
-                            "days": days_span,
-                        }
-                    if (
-                        winrate >= TARGET_WINRATE
-                        and trades_per_day >= MIN_TRADE_PER_DAY
-                        and trades >= MIN_TRADES_VAL
-                    ):
-                        early_stop = True
+                        winrate = sim_summary["winrate"]
+                        trades_per_day = sim_summary["predsPerDay"]
+                        trades = sim_summary["predCount"]
+                        days_span = sim_summary["daysSpan"]
+                        print(
+                            "TUNE symbol={} trial={} model=HGB params={} pTrade={} pGap={} valWinrate={:.6f} valTrades={} valDays={} valTradesPerDay={:.6f}".format(
+                                symbol,
+                                trial_index,
+                                params,
+                                p_trade,
+                                p_gap,
+                                winrate,
+                                trades,
+                                days_span,
+                                trades_per_day,
+                            )
+                        )
+                        valid = trades >= MIN_TRADES_VAL and trades_per_day >= MIN_TRADE_PER_DAY
+                        if not valid:
+                            soft_valid = trades >= 200 and trades_per_day >= MIN_TRADE_PER_DAY
+                            if soft_valid:
+                                metric = (winrate, trades_per_day, trades)
+                                if fallback_best is None or metric > fallback_best["metric"]:
+                                    fallback_best = {
+                                        "metric": metric,
+                                        "params": params,
+                                        "p_trade": p_trade,
+                                        "p_gap": p_gap,
+                                        "winrate": winrate,
+                                        "preds": trades,
+                                        "preds_per_day": trades_per_day,
+                                        "days": days_span,
+                                    }
+                            continue
+                        metric = (winrate, trades_per_day, trades)
+                        if best_trial is None or metric > best_trial["metric"]:
+                            best_trial = {
+                                "metric": metric,
+                                "params": params,
+                                "p_trade": p_trade,
+                                "p_gap": p_gap,
+                                "winrate": winrate,
+                                "preds": trades,
+                                "preds_per_day": trades_per_day,
+                                "days": days_span,
+                            }
+                        if (
+                            winrate >= TARGET_WINRATE
+                            and trades_per_day >= MIN_TRADE_PER_DAY
+                            and trades >= MIN_TRADES_VAL
+                        ):
+                            early_stop = True
+                            break
+                    if early_stop:
                         break
                 if best_trial and (best is None or best_trial["metric"] > best["metric"]):
                     best = {**best_trial, "model": "HGB"}
+                    constraints_relaxed = False
+                elif best_trial is None and fallback_best is not None and best is None:
+                    print("WARN_CONSTRAINTS_RELAXED symbol={} model=HGB".format(symbol))
+                    best = {**fallback_best, "model": "HGB"}
+                    constraints_relaxed = True
                 if early_stop:
                     break
         if best is None:
@@ -1308,6 +1500,7 @@ def main() -> None:
             continue
         best_params = best["params"]
         selected_p_trade = best["p_trade"]
+        selected_p_gap = best.get("p_gap", 0.0)
         train_long = pd.concat([x_long_train, x_long_val], axis=0)
         train_short = pd.concat([x_short_train, x_short_val], axis=0)
         train_long_y = pd.concat([y_long_train, y_long_val], axis=0)
@@ -1352,7 +1545,9 @@ def main() -> None:
             val_sim_path,
             conf_thr=CONF_THRESHOLD,
             p_trade=selected_p_trade,
+            p_gap=selected_p_gap,
             horizon_bars=MAX_HORIZON_BARS,
+            write_preds=True,
         )
         test_sim_path = args.out_dir / symbol / "sim_test.jsonl"
         test_summary = simulate_trade_only(
@@ -1364,7 +1559,9 @@ def main() -> None:
             test_sim_path,
             conf_thr=CONF_THRESHOLD,
             p_trade=selected_p_trade,
+            p_gap=selected_p_gap,
             horizon_bars=MAX_HORIZON_BARS,
+            write_preds=True,
         )
         print(
             "FINAL symbol={} model={} bestParams={} pTradeSelected={} testWinrate={:.6f} testTrades={} testDays={} testTradesPerDay={:.6f}".format(
@@ -1434,6 +1631,8 @@ def main() -> None:
                     test_count,
                     False,
                     False,
+                    selected_p_gap,
+                    constraints_relaxed,
                 )
                 print("MODEL_SKIPPED symbol={} side={} reason=not_trained".format(symbol, side))
                 continue
@@ -1476,6 +1675,8 @@ def main() -> None:
                     test_count,
                     False,
                     False,
+                    selected_p_gap,
+                    constraints_relaxed,
                 )
                 continue
             prob_output_name = "probabilities" if "probabilities" in output_names else None
@@ -1518,6 +1719,8 @@ def main() -> None:
                 test_count,
                 False,
                 True,
+                selected_p_gap,
+                constraints_relaxed,
             )
             write_current(model_dir, args.out_dir, symbol, side)
             print(
