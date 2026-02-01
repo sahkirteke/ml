@@ -4,7 +4,6 @@ import argparse
 import itertools
 import json
 import math
-import random
 import re
 import time
 import warnings
@@ -15,13 +14,9 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.base import clone
+from sklearn.metrics import accuracy_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from skl2onnx import convert_sklearn
@@ -50,7 +45,6 @@ FEATURE_ORDER = [
 ]
 
 FEATURES_VERSION = "ftr_5m_v1"
-LABEL_TYPE = "tp0_004_sl0_002_within_7_tp_before_sl"
 MAX_HORIZON_BARS = 7
 TP_PCT = 0.004
 SL_PCT = 0.002
@@ -74,6 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-acc", default=0.65, type=float, help="Target accHi to stop tuning")
     parser.add_argument("--min-coverage", default=0.0002, type=float, help="Minimum coverage to stop tuning")
     parser.add_argument("--conf-threshold", default=CONF_THRESHOLD, type=float, help="Confidence threshold")
+    parser.add_argument("--min-orders-per-day", default=7.0, type=float, help="Minimum orders per day")
+    parser.add_argument("--min-total-orders", default=500, type=int, help="Minimum total orders in validation")
     parser.add_argument("--eval-only", action="store_true", help="Only run evaluation (skip export)")
     parser.add_argument("--fast-tail", action="store_true", help="Read only the latest rows needed")
     return parser.parse_args()
@@ -192,7 +188,67 @@ def load_raw_frames(
     return raw, selected_files
 
 
-def build_labels_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+def outcome_long(
+    close_time: np.ndarray,
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    idx: int,
+) -> tuple[int, int, str] | None:
+    entry = close[idx]
+    if np.isnan(entry):
+        return None
+    tp_price = entry * (1.0 + TP_PCT)
+    sl_price = entry * (1.0 - SL_PCT)
+    for k in range(1, MAX_HORIZON_BARS + 1):
+        if close_time[idx + k] - close_time[idx + k - 1] != GAP_MS:
+            return None
+        hi = high[idx + k]
+        lo = low[idx + k]
+        if np.isnan(hi) or np.isnan(lo):
+            return None
+        hit_tp = hi >= tp_price
+        hit_sl = lo <= sl_price
+        if hit_tp and hit_sl:
+            return 0, k, "SL_HIT_SAME_BAR"
+        if hit_sl:
+            return 0, k, "SL_HIT"
+        if hit_tp:
+            return 1, k, "TP_HIT"
+    return None
+
+
+def outcome_short(
+    close_time: np.ndarray,
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    idx: int,
+) -> tuple[int, int, str] | None:
+    entry = close[idx]
+    if np.isnan(entry):
+        return None
+    tp_price = entry * (1.0 - TP_PCT)
+    sl_price = entry * (1.0 + SL_PCT)
+    for k in range(1, MAX_HORIZON_BARS + 1):
+        if close_time[idx + k] - close_time[idx + k - 1] != GAP_MS:
+            return None
+        hi = high[idx + k]
+        lo = low[idx + k]
+        if np.isnan(hi) or np.isnan(lo):
+            return None
+        hit_tp = lo <= tp_price
+        hit_sl = hi >= sl_price
+        if hit_tp and hit_sl:
+            return 0, k, "SL_HIT_SAME_BAR"
+        if hit_sl:
+            return 0, k, "SL_HIT"
+        if hit_tp:
+            return 1, k, "TP_HIT"
+    return None
+
+
+def build_labels_from_raw(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     required_columns = ["closeTimeMs", "highPrice", "lowPrice", "closePrice"]
     missing = [col for col in required_columns if col not in raw.columns]
     if missing:
@@ -202,107 +258,121 @@ def build_labels_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
     high = pd.to_numeric(raw_sorted["highPrice"], errors="coerce").to_numpy(dtype=np.float64)
     low = pd.to_numeric(raw_sorted["lowPrice"], errors="coerce").to_numpy(dtype=np.float64)
     close = pd.to_numeric(raw_sorted["closePrice"], errors="coerce").to_numpy(dtype=np.float64)
-    records: list[dict[str, object]] = []
-    gap_ok = np.diff(close_time) == GAP_MS
+    long_records: list[dict[str, object]] = []
+    short_records: list[dict[str, object]] = []
     for idx in range(len(raw_sorted) - MAX_HORIZON_BARS):
-        if np.isnan(close_time[idx]) or np.isnan(close[idx]):
+        if np.isnan(close_time[idx]):
             continue
-        if not gap_ok[idx : idx + MAX_HORIZON_BARS].all():
+        long_outcome = outcome_long(close_time, close, high, low, idx)
+        short_outcome = outcome_short(close_time, close, high, low, idx)
+        if long_outcome is None and short_outcome is None:
             continue
-        entry = close[idx]
-        tp_price = entry * (1.0 + TP_PCT)
-        sl_price = entry * (1.0 - SL_PCT)
-        label_hit = 0
-        event = "NO_TP"
-        time_to_event: int | None = None
-        invalid = False
-        for k in range(1, MAX_HORIZON_BARS + 1):
-            hi = high[idx + k]
-            lo = low[idx + k]
-            if np.isnan(hi) or np.isnan(lo):
-                invalid = True
-                break
-            hit_tp = hi >= tp_price
-            hit_sl = lo <= sl_price
-            if hit_tp and hit_sl:
-                label_hit = 0
-                event = "SL_FIRST"
-                time_to_event = k
-                break
-            if hit_sl:
-                label_hit = 0
-                event = "SL_FIRST"
-                time_to_event = k
-                break
-            if hit_tp:
-                label_hit = 1
-                event = "TP_FIRST"
-                time_to_event = k
-                break
-        if invalid:
-            continue
-        record: dict[str, object] = {
+        base_record: dict[str, object] = {
             "closeTimeMs": int(close_time[idx]),
-            "labelType": LABEL_TYPE,
-            "labelHit": int(label_hit),
-            "event": event,
-            "timeToEvent": time_to_event,
             "tpPct": TP_PCT,
             "slPct": SL_PCT,
             "maxHorizonBars": MAX_HORIZON_BARS,
         }
         if "symbol" in raw_sorted.columns:
-            record["symbol"] = raw_sorted.at[idx, "symbol"]
+            base_record["symbol"] = raw_sorted.at[idx, "symbol"]
         if "tf" in raw_sorted.columns:
-            record["tf"] = raw_sorted.at[idx, "tf"]
-        records.append(record)
-    if not records:
-        return pd.DataFrame()
-    return pd.DataFrame(records)
+            base_record["tf"] = raw_sorted.at[idx, "tf"]
+        if long_outcome is not None:
+            label_hit, time_to_event, event = long_outcome
+            record = dict(base_record)
+            record.update(
+                {
+                    "labelType": "tp0_004_sl0_002_within_7_event_driven_LONG",
+                    "labelHit": int(label_hit),
+                    "timeToEvent": int(time_to_event),
+                    "event": event,
+                }
+            )
+            long_records.append(record)
+        if short_outcome is not None:
+            label_hit, time_to_event, event = short_outcome
+            record = dict(base_record)
+            record.update(
+                {
+                    "labelType": "tp0_004_sl0_002_within_7_event_driven_SHORT",
+                    "labelHit": int(label_hit),
+                    "timeToEvent": int(time_to_event),
+                    "event": event,
+                }
+            )
+            short_records.append(record)
+    return pd.DataFrame(long_records), pd.DataFrame(short_records)
 
 
-def build_training_frame(
+def build_training_frames(
     features: pd.DataFrame, raw: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, list[str]]:
+) -> tuple[
+    tuple[pd.DataFrame, pd.Series, np.ndarray],
+    tuple[pd.DataFrame, pd.Series, np.ndarray],
+    list[str],
+]:
     features_filtered = features[(features["windowReady"] == True) & (features["featuresVersion"] == FEATURES_VERSION)]
     if features_filtered.empty:
         raise RuntimeError("No rows available after filtering features")
     if raw.empty:
         raise RuntimeError("Raw data required for label generation is empty")
-    label_frame = build_labels_from_raw(raw)
-    if label_frame.empty:
+    long_labels, short_labels = build_labels_from_raw(raw)
+    if long_labels.empty and short_labels.empty:
         raise RuntimeError("No rows available after labeling")
-    if "symbol" not in label_frame.columns:
-        if "symbol" in features_filtered.columns and features_filtered["symbol"].nunique() == 1:
-            label_frame["symbol"] = features_filtered["symbol"].iloc[0]
-        else:
-            raise RuntimeError("Label data missing symbol for join")
-    if "tf" not in label_frame.columns:
-        if "tf" in features_filtered.columns and features_filtered["tf"].nunique() == 1:
-            label_frame["tf"] = features_filtered["tf"].iloc[0]
-        else:
-            raise RuntimeError("Label data missing tf for join")
-    merged = features_filtered.merge(
-        label_frame,
+    def ensure_symbol_tf(labels: pd.DataFrame) -> pd.DataFrame:
+        if labels.empty:
+            return labels
+        if "symbol" not in labels.columns:
+            if "symbol" in features_filtered.columns and features_filtered["symbol"].nunique() == 1:
+                labels = labels.copy()
+                labels["symbol"] = features_filtered["symbol"].iloc[0]
+            else:
+                raise RuntimeError("Label data missing symbol for join")
+        if "tf" not in labels.columns:
+            if "tf" in features_filtered.columns and features_filtered["tf"].nunique() == 1:
+                labels = labels.copy()
+                labels["tf"] = features_filtered["tf"].iloc[0]
+            else:
+                raise RuntimeError("Label data missing tf for join")
+        return labels
+
+    long_labels = ensure_symbol_tf(long_labels)
+    short_labels = ensure_symbol_tf(short_labels)
+    merged_long = features_filtered.merge(
+        long_labels,
         on=["symbol", "tf", "closeTimeMs"],
         how="inner",
-    )
-    if merged.empty:
+    ).sort_values("closeTimeMs").reset_index(drop=True)
+    merged_short = features_filtered.merge(
+        short_labels,
+        on=["symbol", "tf", "closeTimeMs"],
+        how="inner",
+    ).sort_values("closeTimeMs").reset_index(drop=True)
+    if merged_long.empty and merged_short.empty:
         raise RuntimeError("No rows available after joining features and labels")
-    merged = merged.sort_values("closeTimeMs").reset_index(drop=True)
-    missing_features = [col for col in FEATURE_ORDER if col not in merged.columns]
+    missing_features = [col for col in FEATURE_ORDER if col not in features_filtered.columns]
     if missing_features:
         raise RuntimeError(f"Missing expected feature columns: {missing_features}")
-    x = merged[FEATURE_ORDER].copy()
-    x = x.apply(pd.to_numeric, errors="coerce")
-    x.replace([np.inf, -np.inf], np.nan, inplace=True)
-    x = x.astype(np.float32)
-    y = merged["labelHit"].astype(int)
-    stds = x.std(axis=0, skipna=True)
-    keep_cols = [col for col in x.columns if stds[col] > 0]
-    if keep_cols and len(keep_cols) != len(x.columns):
-        x = x[keep_cols].copy()
-    return x, y, merged, list(x.columns)
+
+    def build_xy(merged: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, np.ndarray]:
+        if merged.empty:
+            return pd.DataFrame(), pd.Series(dtype=int), np.array([])
+        x = merged[FEATURE_ORDER].copy()
+        x = x.apply(pd.to_numeric, errors="coerce")
+        x.replace([np.inf, -np.inf], np.nan, inplace=True)
+        x = x.astype(np.float32)
+        stds = x.std(axis=0, skipna=True)
+        keep_cols = [col for col in x.columns if stds[col] > 0]
+        if keep_cols and len(keep_cols) != len(x.columns):
+            x = x[keep_cols].copy()
+        y = merged["labelHit"].astype(int)
+        close_times = pd.to_numeric(merged["closeTimeMs"], errors="coerce").to_numpy(dtype=np.float64)
+        return x, y, close_times
+
+    x_long, y_long, close_long = build_xy(merged_long)
+    x_short, y_short, close_short = build_xy(merged_short)
+    feature_order = list(x_long.columns if not x_long.empty else x_short.columns)
+    return (x_long, y_long, close_long), (x_short, y_short, close_short), feature_order
 
 
 def build_lr_pipeline(
@@ -338,58 +408,6 @@ def build_lr_pipeline(
     return Pipeline(base_steps + [("classifier", lr)])
 
 
-def build_rf_pipeline(
-    *,
-    n_estimators: int,
-    max_depth: int,
-    min_samples_leaf: int,
-    class_weight: str | None,
-) -> Pipeline:
-    rf = RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        min_samples_leaf=min_samples_leaf,
-        class_weight=class_weight,
-        n_jobs=-1,
-        random_state=42,
-    )
-    return Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("classifier", rf),
-        ]
-    )
-
-
-def build_model(model_name: str, params: dict[str, object]):
-    if model_name == "LR":
-        return build_lr_pipeline(
-            params["solver"],
-            c_value=float(params["C"]),
-            class_weight=params["class_weight"],
-            max_iter=int(params["max_iter"]),
-            tol=float(params["tol"]),
-        )
-    if model_name == "RF":
-        return build_rf_pipeline(
-            n_estimators=int(params["n_estimators"]),
-            max_depth=int(params["max_depth"]),
-            min_samples_leaf=int(params["min_samples_leaf"]),
-            class_weight=params["class_weight"],
-        )
-    return HistGradientBoostingClassifier(
-        max_depth=int(params["max_depth"]),
-        max_iter=int(params["max_iter"]),
-        learning_rate=float(params["learning_rate"]),
-        min_samples_leaf=int(params["min_samples_leaf"]),
-        l2_regularization=float(params["l2_regularization"]),
-        early_stopping=True,
-        validation_fraction=0.1,
-        n_iter_no_change=10,
-        random_state=42,
-    )
-
-
 def export_onnx(model, feature_count: int, output_path: Path) -> tuple[list[str], list[str]]:
     initial_type = [("input", FloatTensorType([None, feature_count]))]
     onnx_model = convert_sklearn(
@@ -416,20 +434,20 @@ def write_meta(
     feature_order: list[str],
     onnx_outputs: list[str],
     prob_output_name: str | None,
+    label_type: str,
+    best_params: dict[str, object],
     val_acc_hi: float,
     val_coverage: float,
-    val_acc_all: float,
-    best_train_rows: int,
-    test_rows: int,
-    best_model: str,
-    best_params: dict[str, object],
-    conf_threshold: float,
-    target_acc: float,
-    min_coverage: float,
+    val_orders: int,
+    val_orders_per_day: float,
+    val_days: int,
+    val_rows: int,
     test_acc_hi: float,
     test_coverage: float,
-    test_acc_all: float,
-    val_rows: int,
+    test_orders: int,
+    test_orders_per_day: float,
+    test_days: int,
+    test_rows: int,
     export_fallback: bool,
 ) -> None:
     def _json_default(o):
@@ -455,26 +473,25 @@ def write_meta(
         "days": train_days,
         "trainRows": train_rows,
         "trainDays": train_days,
-        "labelType": LABEL_TYPE,
+        "labelType": label_type,
         "tpPct": TP_PCT,
         "slPct": SL_PCT,
         "maxHorizonBars": MAX_HORIZON_BARS,
         "classes": classes,
         "upClassIndex": up_class_index,
-        "bestModel": best_model,
         "bestParams": best_params,
-        "confThreshold": conf_threshold,
-        "targetAcc": target_acc,
-        "minCoverage": min_coverage,
         "valAccHi": val_acc_hi,
         "valCoverage": val_coverage,
-        "valAccAll": val_acc_all,
-        "bestTrainRows": best_train_rows,
+        "valOrders": val_orders,
+        "valOrdersPerDay": val_orders_per_day,
+        "valDaysSpan": val_days,
         "valRows": val_rows,
-        "testRows": test_rows,
         "testAccHi": test_acc_hi,
         "testCoverage": test_coverage,
-        "testAccAll": test_acc_all,
+        "testOrders": test_orders,
+        "testOrdersPerDay": test_orders_per_day,
+        "testDaysSpan": test_days,
+        "testRows": test_rows,
         "exportFallback": export_fallback,
         "onnxOutputs": onnx_outputs,
         "probOutputName": prob_output_name,
@@ -486,8 +503,8 @@ def write_meta(
     )
 
 
-def write_current(model_dir: Path, out_dir: Path, symbol: str) -> None:
-    current_dir = out_dir / symbol / "current"
+def write_current(model_dir: Path, out_dir: Path, symbol: str, variant: str) -> None:
+    current_dir = out_dir / symbol / f"current_{variant}"
     current_dir.mkdir(parents=True, exist_ok=True)
     model_src = model_dir / "model.onnx"
     meta_src = model_dir / "model_meta.json"
@@ -501,28 +518,49 @@ def write_current(model_dir: Path, out_dir: Path, symbol: str) -> None:
     meta_tmp.replace(meta_dst)
 
 
-def compute_metrics(
+def check_onnx_outputs(symbol: str, model_path: Path, x_check: np.ndarray) -> None:
+    try:
+        import onnxruntime as ort
+
+        sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        input_name = sess.get_inputs()[0].name
+        outputs = sess.run(None, {input_name: x_check})
+        if not outputs:
+            print("WARN_ONNX_MISMATCH symbol={} probShape={}".format(symbol, None))
+            return
+        prob_shape = None
+        for output in outputs:
+            arr = np.array(output)
+            if arr.ndim == 1 and arr.shape[0] == 2:
+                prob_shape = arr.shape
+                break
+            if arr.ndim == 2 and arr.shape[1] == 2:
+                prob_shape = arr.shape
+                break
+        if prob_shape is None:
+            output_shapes = [np.array(output).shape for output in outputs]
+            print("WARN_ONNX_MISMATCH symbol={} probShape={}".format(symbol, output_shapes))
+    except Exception as exc:
+        print(f"WARN_ONNX_MISMATCH symbol={symbol} error={exc}")
+
+
+def compute_confidence_metrics(
     y_true: pd.Series,
     preds: np.ndarray,
-    proba: np.ndarray,
+    p_hit: np.ndarray,
     *,
     conf_threshold: float,
-) -> tuple[float, float, float, dict[str, int], float]:
-    acc_all = float(accuracy_score(y_true, preds))
-    p_hit = proba
+    days_span: int,
+) -> tuple[float, float, int, float]:
     confidence = np.maximum(p_hit, 1.0 - p_hit)
-    coverage_mask = confidence >= conf_threshold
-    coverage = float(np.mean(coverage_mask)) if len(confidence) else 0.0
-    if np.any(coverage_mask):
-        acc_hi = float(accuracy_score(y_true[coverage_mask], preds[coverage_mask]))
-    else:
-        acc_hi = float("nan")
-    matrix = confusion_matrix(y_true, preds, labels=[0, 1]).tolist()
-    tn, fp = matrix[0]
-    fn, tp = matrix[1]
-    confusion = {"tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn)}
-    win_rate = float(np.mean(y_true)) if len(y_true) else 0.0
-    return acc_all, coverage, acc_hi, confusion, win_rate
+    trade_mask = confidence >= conf_threshold
+    orders = int(np.sum(trade_mask))
+    coverage = float(orders / len(confidence)) if len(confidence) else 0.0
+    orders_per_day = float(orders / max(days_span, 1))
+    if not np.any(trade_mask):
+        return float("nan"), coverage, orders, orders_per_day
+    acc_hi = float(accuracy_score(y_true[trade_mask], preds[trade_mask]))
+    return acc_hi, coverage, orders, orders_per_day
 
 
 def main() -> None:
@@ -554,77 +592,95 @@ def main() -> None:
             fast_tail=args.fast_tail,
             need_rows=need_rows,
         )
-        x, y, merged, feature_order = build_training_frame(features, raw)
-        if len(x) < args.min_rows_per_symbol:
-            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} min={args.min_rows_per_symbol}")
-            continue
-        if args.test_rows <= 0 or args.val_rows <= 0:
-            raise RuntimeError("--test-rows and --val-rows must be > 0")
-        if len(x) <= args.test_rows + args.val_rows:
+        (long_data, short_data, feature_order) = build_training_frames(features, raw)
+        side_configs = [
+            ("long", long_data, "tp0_004_sl0_002_within_7_event_driven_LONG"),
+            ("short", short_data, "tp0_004_sl0_002_within_7_event_driven_SHORT"),
+        ]
+        for side, (x, y, close_time), label_type in side_configs:
+            if len(x) < args.min_rows_per_symbol:
+                print(
+                    "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} side={} rows={} min={}".format(
+                        symbol, side, len(x), args.min_rows_per_symbol
+                    )
+                )
+                continue
+            if args.test_rows <= 0 or args.val_rows <= 0:
+                raise RuntimeError("--test-rows and --val-rows must be > 0")
+            if len(x) <= args.test_rows + args.val_rows:
+                print(
+                    "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} side={} rows={} min={}".format(
+                        symbol, side, len(x), args.min_rows_per_symbol
+                    )
+                )
+                continue
+            x = x.reset_index(drop=True)
+            y = y.reset_index(drop=True)
+            test_rows = args.test_rows
+            val_rows = args.val_rows
+            test_start = len(x) - test_rows
+            val_start = test_start - val_rows
+            x_train_pool = x.iloc[:val_start]
+            y_train_pool = y.iloc[:val_start]
+            x_val = x.iloc[val_start:test_start]
+            y_val = y.iloc[val_start:test_start]
+            x_test = x.iloc[test_start:]
+            y_test = y.iloc[test_start:]
+            val_close = close_time[val_start:test_start]
+            test_close = close_time[test_start:]
+            if len(x_train_pool) > TRAIN_LIMIT:
+                x_train_pool = x_train_pool.iloc[-TRAIN_LIMIT:]
+                y_train_pool = y_train_pool.iloc[-TRAIN_LIMIT:]
+
+            def compute_span(values: np.ndarray) -> int:
+                if len(values) == 0:
+                    return 0
+                start_ms = int(np.nanmin(values))
+                end_ms = int(np.nanmax(values))
+                return int(math.ceil((end_ms - start_ms + 1) / 86_400_000))
+
+            val_days = compute_span(val_close)
+            test_days = compute_span(test_close)
+            pos_rate_val = float(np.mean(y_val)) if len(y_val) else 0.0
+            pos_rate_test = float(np.mean(y_test)) if len(y_test) else 0.0
+            baseline_val = max(pos_rate_val, 1.0 - pos_rate_val)
+            baseline_test = max(pos_rate_test, 1.0 - pos_rate_test)
             print(
-                f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} "
-                f"min={args.min_rows_per_symbol}"
+                "DATA_STATS symbol={} side={} trainRows={} valRows={} testRows={}".format(
+                    symbol, side, len(x_train_pool), len(x_val), len(x_test)
+                )
             )
-            continue
-        x = x.reset_index(drop=True)
-        y = y.reset_index(drop=True)
-        test_rows = args.test_rows
-        val_rows = args.val_rows
-        test_start = len(x) - test_rows
-        val_start = test_start - val_rows
-        x_train_pool = x.iloc[:val_start]
-        y_train_pool = y.iloc[:val_start]
-        x_val = x.iloc[val_start:test_start]
-        y_val = y.iloc[val_start:test_start]
-        x_test = x.iloc[test_start:]
-        y_test = y.iloc[test_start:]
-        if len(x_train_pool) > TRAIN_LIMIT:
-            x_train_pool = x_train_pool.iloc[-TRAIN_LIMIT:]
-            y_train_pool = y_train_pool.iloc[-TRAIN_LIMIT:]
-        conf_threshold = args.conf_threshold
-        best = None
-        best_exportable = None
-        candidates = []
-        trial_candidates = []
-        if args.auto_tune:
-            lr_trials = [
-                ("LR", params)
-                for params in itertools.product(
+            print(
+                "SPAN symbol={} side={} valDays={} testDays={}".format(
+                    symbol, side, val_days, test_days
+                )
+            )
+            print(
+                "POS_RATE symbol={} side={} valPos={:.6f} testPos={:.6f}".format(
+                    symbol, side, pos_rate_val, pos_rate_test
+                )
+            )
+            print(
+                "BASELINE symbol={} side={} valBaseline={:.6f} testBaseline={:.6f}".format(
+                    symbol, side, baseline_val, baseline_test
+                )
+            )
+            conf_threshold = args.conf_threshold
+            best = None
+            lr_params = list(
+                itertools.product(
                     [0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
                     [None, "balanced"],
                     ["lbfgs", "saga"],
                     [4000],
                     [1e-4, 1e-3],
                 )
-            ]
-            rf_trials = [
-                ("RF", params)
-                for params in itertools.product(
-                    [200, 400],
-                    [6, 8, 10],
-                    [20, 50],
-                    [None, "balanced"],
-                )
-            ]
-            hgb_param_grid = list(
-                itertools.product(
-                    [3, 5, 7, 9],
-                    [100, 200, 400],
-                    [0.03, 0.05, 0.1],
-                    [20, 50, 100],
-                    [0.0, 0.1, 1.0],
-                )
             )
-            random.seed(42)
-            random.shuffle(hgb_param_grid)
-            hgb_trials = [("HGB", params) for params in hgb_param_grid[:30]]
-            trial_candidates = lr_trials + hgb_trials + rf_trials
+            if not args.auto_tune:
+                lr_params = [(1.0, None, "lbfgs", 4000, 1e-4)]
             if args.max_trials:
-                trial_candidates = trial_candidates[: args.max_trials]
-        else:
-            trial_candidates = [("LR", (1.0, None, "lbfgs", 4000, 1e-4))]
-        for trial_index, (model_name, params_raw) in enumerate(trial_candidates, start=1):
-            if model_name == "LR":
+                lr_params = lr_params[: args.max_trials]
+            for trial_index, params_raw in enumerate(lr_params, start=1):
                 c_value, class_weight, solver, max_iter, tol = params_raw
                 params = {
                     "C": c_value,
@@ -640,275 +696,183 @@ def main() -> None:
                     max_iter=max_iter,
                     tol=tol,
                 )
-            elif model_name == "RF":
-                n_estimators, max_depth, min_samples_leaf, class_weight = params_raw
-                params = {
-                    "n_estimators": n_estimators,
-                    "max_depth": max_depth,
-                    "min_samples_leaf": min_samples_leaf,
-                    "class_weight": class_weight,
-                }
-                model = build_rf_pipeline(
-                    n_estimators=n_estimators,
-                    max_depth=max_depth,
-                    min_samples_leaf=min_samples_leaf,
-                    class_weight=class_weight,
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", ConvergenceWarning)
+                    model.fit(x_train_pool, y_train_pool)
+                has_convergence_warning = any(
+                    isinstance(warning.message, ConvergenceWarning) for warning in caught
                 )
-            else:
-                max_depth, max_iter, learning_rate, min_samples_leaf, l2_regularization = params_raw
-                params = {
-                    "max_depth": max_depth,
-                    "max_iter": max_iter,
-                    "learning_rate": learning_rate,
-                    "min_samples_leaf": min_samples_leaf,
-                    "l2_regularization": l2_regularization,
-                }
-                model = build_model("HGB", params)
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always", ConvergenceWarning)
-                model.fit(x_train_pool, y_train_pool)
-            has_convergence_warning = any(
-                isinstance(warning.message, ConvergenceWarning) for warning in caught
-            )
-            if has_convergence_warning:
-                print(
-                    "WARN_CONVERGENCE symbol={} model={} params={}".format(symbol, model_name, params)
-                )
-            val_proba = model.predict_proba(x_val)
-            classes = list(getattr(model, "classes_", []))
-            if not classes and isinstance(model, Pipeline):
-                classes = list(model.named_steps["classifier"].classes_)
-            if 1 not in classes:
-                raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
-            pos_index = classes.index(1)
-            p_hit = val_proba[:, pos_index]
-            val_preds = model.predict(x_val)
-            acc_all, coverage, acc_hi, _, _ = compute_metrics(
-                y_val,
-                val_preds,
-                p_hit,
-                conf_threshold=conf_threshold,
-            )
-            print(
-                "TUNE symbol={} trial={} model={} params={} accAll={:.6f} accHi={} coverage={:.6f}".format(
-                    symbol,
-                    trial_index,
-                    model_name,
-                    params,
-                    acc_all,
-                    "nan" if np.isnan(acc_hi) else f"{acc_hi:.6f}",
-                    coverage,
-                )
-            )
-            score_acc_hi = -1.0 if np.isnan(acc_hi) else acc_hi
-            metric = (score_acc_hi, coverage, acc_all)
-            candidate = {
-                "metric": metric,
-                "params": params,
-                "model": model,
-                "acc_all": acc_all,
-                "coverage": coverage,
-                "acc_hi": acc_hi,
-                "trial_index": trial_index,
-                "model_name": model_name,
-            }
-            candidates.append(candidate)
-            if best is None or metric > best["metric"]:
-                best = candidate
-            if model_name in {"LR", "RF"} and (best_exportable is None or metric > best_exportable["metric"]):
-                best_exportable = candidate
-            if score_acc_hi >= args.target_acc and coverage >= args.min_coverage:
-                break
-        if best is None:
-            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} min={args.min_rows_per_symbol}")
-            continue
-        if (best["metric"][0] < args.target_acc or best["coverage"] < args.min_coverage) and args.auto_tune:
-            top_models = sorted(candidates, key=lambda item: item["metric"], reverse=True)[:3]
-            for candidate in top_models:
-                estimator = build_model(candidate["model_name"], candidate["params"])
-                estimator = clone(estimator)
-                calibrator = CalibratedClassifierCV(
-                    estimator=estimator, method="sigmoid", cv=TimeSeriesSplit(n_splits=3)
-                )
-                calibrator.fit(x_train_pool, y_train_pool)
-                calib_proba = calibrator.predict_proba(x_val)
-                classes = list(calibrator.classes_)
+                if has_convergence_warning:
+                    print("WARN_CONVERGENCE symbol={} side={} params={}".format(symbol, side, params))
+                val_proba = model.predict_proba(x_val)
+                classes = list(getattr(model, "classes_", []))
+                if not classes and isinstance(model, Pipeline):
+                    classes = list(model.named_steps["classifier"].classes_)
                 if 1 not in classes:
-                    raise RuntimeError(f"Class 1 missing from calibrated classes for symbol {symbol}: {classes}")
+                    raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
                 pos_index = classes.index(1)
-                p_hit = calib_proba[:, pos_index]
-                calib_preds = calibrator.predict(x_val)
-                acc_all, coverage, acc_hi, _, _ = compute_metrics(
+                p_hit = val_proba[:, pos_index]
+                val_preds = model.predict(x_val)
+                acc_hi, coverage, val_orders, val_orders_per_day = compute_confidence_metrics(
                     y_val,
-                    calib_preds,
+                    val_preds,
                     p_hit,
                     conf_threshold=conf_threshold,
+                    days_span=val_days,
                 )
-                if (
-                    (np.isnan(candidate["acc_hi"]) or np.isnan(acc_hi) or acc_hi >= candidate["acc_hi"])
-                    and coverage >= candidate["coverage"]
-                ):
-                    score_acc_hi = -1.0 if np.isnan(acc_hi) else acc_hi
-                    metric = (score_acc_hi, coverage, acc_all)
-                    tuned = {
-                        "metric": metric,
-                        "params": candidate["params"],
-                        "model": calibrator,
-                        "acc_all": acc_all,
-                        "coverage": coverage,
-                        "acc_hi": acc_hi,
-                        "trial_index": candidate["trial_index"],
-                        "model_name": f"{candidate['model_name']}_CAL",
-                    }
-                    print(
-                        "TUNE symbol={} trial={} model={} params={} accAll={:.6f} accHi={} coverage={:.6f}".format(
-                            symbol,
-                            candidate["trial_index"],
-                            tuned["model_name"],
-                            tuned["params"],
-                            acc_all,
-                            "nan" if np.isnan(acc_hi) else f"{acc_hi:.6f}",
-                            coverage,
-                        )
+                print(
+                    "TUNE symbol={} side={} trial={} params={} accHi={} coverage={:.6f} "
+                    "valOrders={} valOrdersPerDay={:.6f}".format(
+                        symbol,
+                        side,
+                        trial_index,
+                        params,
+                        "nan" if np.isnan(acc_hi) else f"{acc_hi:.6f}",
+                        coverage,
+                        val_orders,
+                        val_orders_per_day,
                     )
-                    if metric > best["metric"]:
-                        best = tuned
-        best_params = best["params"]
-        best_model_name = best["model_name"]
-        train_val_x = pd.concat([x_train_pool, x_val], axis=0)
-        train_val_y = pd.concat([y_train_pool, y_val], axis=0)
-        if best_model_name.endswith("_CAL"):
-            base_name = best_model_name.replace("_CAL", "")
-            base_estimator = build_model(base_name, best_params)
-            final_model = CalibratedClassifierCV(
-                estimator=base_estimator, method="sigmoid", cv=TimeSeriesSplit(n_splits=3)
+                )
+                score_acc_hi = -1.0 if np.isnan(acc_hi) else acc_hi
+                metric = (score_acc_hi, val_orders_per_day)
+                candidate = {
+                    "metric": metric,
+                    "params": params,
+                    "acc_hi": acc_hi,
+                    "coverage": coverage,
+                    "val_orders": val_orders,
+                    "val_orders_per_day": val_orders_per_day,
+                }
+                if best is None or metric > best["metric"]:
+                    best = candidate
+                if (
+                    score_acc_hi >= args.target_acc
+                    and val_orders_per_day >= args.min_orders_per_day
+                    and val_orders >= args.min_total_orders
+                ):
+                    break
+            if best is None:
+                print(
+                    "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} side={} rows={} min={}".format(
+                        symbol, side, len(x), args.min_rows_per_symbol
+                    )
+                )
+                continue
+            best_params = best["params"]
+            train_val_x = pd.concat([x_train_pool, x_val], axis=0)
+            train_val_y = pd.concat([y_train_pool, y_val], axis=0)
+            final_model = build_lr_pipeline(
+                best_params["solver"],
+                c_value=best_params["C"],
+                class_weight=best_params["class_weight"],
+                max_iter=best_params["max_iter"],
+                tol=best_params["tol"],
             )
-        else:
-            final_model = build_model(best_model_name, best_params)
-        final_model.fit(train_val_x, train_val_y)
-        test_proba = final_model.predict_proba(x_test)
-        classes = list(getattr(final_model, "classes_", []))
-        if not classes and isinstance(final_model, Pipeline):
-            classes = list(final_model.named_steps["classifier"].classes_)
-        if 1 not in classes:
-            raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
-        up_class_index = classes.index(1)
-        test_p_hit = test_proba[:, up_class_index]
-        test_preds = final_model.predict(x_test)
-        test_acc_all, test_coverage, test_acc_hi, _, _ = compute_metrics(
-            y_test,
-            test_preds,
-            test_p_hit,
-            conf_threshold=conf_threshold,
-        )
-        print(
-            "FINAL symbol={} bestModel={} bestParams={} testAccHi={} testCoverage={:.6f}".format(
-                symbol,
-                best_model_name,
-                best_params,
-                "nan" if np.isnan(test_acc_hi) else f"{test_acc_hi:.6f}",
-                test_coverage,
+            final_model.fit(train_val_x, train_val_y)
+            val_proba = final_model.predict_proba(x_val)
+            test_proba = final_model.predict_proba(x_test)
+            classes = list(getattr(final_model, "classes_", []))
+            if not classes and isinstance(final_model, Pipeline):
+                classes = list(final_model.named_steps["classifier"].classes_)
+            if 1 not in classes:
+                raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
+            up_class_index = classes.index(1)
+            val_p_hit = val_proba[:, up_class_index]
+            test_p_hit = test_proba[:, up_class_index]
+            val_preds = final_model.predict(x_val)
+            test_preds = final_model.predict(x_test)
+            val_acc_hi, val_coverage, val_orders, val_orders_per_day = compute_confidence_metrics(
+                y_val,
+                val_preds,
+                val_p_hit,
+                conf_threshold=conf_threshold,
+                days_span=val_days,
             )
-        )
-        model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
-        model_dir = args.out_dir / symbol / model_version
-        export_model = final_model
-        export_fallback = False
-        if args.eval_only:
+            test_acc_hi, test_coverage, test_orders, test_orders_per_day = compute_confidence_metrics(
+                y_test,
+                test_preds,
+                test_p_hit,
+                conf_threshold=conf_threshold,
+                days_span=test_days,
+            )
             print(
-                "EVAL_ONLY symbol={} train_rows={} val_rows={} test_rows={}".format(
-                    symbol, len(train_val_x), val_rows, test_rows
+                "ORDERS symbol={} side={} valOrders={} valOrdersPerDay={:.6f} "
+                "testOrders={} testOrdersPerDay={:.6f}".format(
+                    symbol,
+                    side,
+                    val_orders,
+                    val_orders_per_day,
+                    test_orders,
+                    test_orders_per_day,
                 )
             )
-            continue
-        try:
-            input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
-            print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
-        except Exception as exc:
-            print(f"ONNX_EXPORT_FAILED symbol={symbol} error=({exc}); fallback: export base model.")
-            if best_model_name.startswith("HGB") and best_exportable is not None:
-                export_model = build_model(best_exportable["model_name"], best_exportable["params"])
-                export_model.fit(train_val_x, train_val_y)
-                export_fallback = True
-            else:
-                export_model = final_model
-            input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
-            print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
-        prob_output_name = "probabilities" if "probabilities" in output_names else None
-        onnx_checked = True
-        if onnx_checked:
-            try:
-                import onnxruntime as ort
-
-                sess = ort.InferenceSession(str(model_dir / "model.onnx"), providers=["CPUExecutionProvider"])
-                input_name = sess.get_inputs()[0].name
-                x_check = x.iloc[:256].to_numpy(dtype=np.float32)
-                outputs = sess.run(None, {input_name: x_check})
-                if outputs:
-                    prob_output = None
-                    label_output = None
-                    for output in outputs:
-                        arr = np.array(output)
-                        if arr.ndim == 1 and arr.shape[0] == 2:
-                            prob_output = arr
-                        elif arr.ndim == 2 and arr.shape[1] == 2:
-                            prob_output = arr
-                        elif arr.ndim == 1 or arr.ndim == 2:
-                            label_output = arr
-                    if prob_output is None:
-                        print(f"WARN_ONNX_MISMATCH symbol={symbol} reason=missing_probabilities")
-                    else:
-                        if prob_output.ndim == 1:
-                            p_hit = float(prob_output[1])
-                            mean_conf = float(np.max(prob_output))
-                        else:
-                            p_hit = float(prob_output[0, 1])
-                            mean_conf = float(np.mean(np.max(prob_output, axis=1)))
-                        print(f"ONNX_CHECK symbol={symbol} meanMaxProb={mean_conf:.6f}")
-                        print(f"PRED symbol={symbol} pHit={p_hit:.6f}")
-                    if label_output is not None and label_output.ndim == 2 and label_output.shape[1] == 1:
-                        _ = label_output.ravel()
-                else:
-                    print(f"WARN_ONNX_MISMATCH symbol={symbol} reason=no_outputs")
-            except Exception as exc:
-                print(f"WARN_ONNX_MISMATCH symbol={symbol} error={exc}")
-        train_days = len(extract_dates(feature_files))
-        write_meta(
-            model_dir / "model_meta.json",
-            model_version,
-            symbol,
-            train_days,
-            len(train_val_x),
-            [int(value) for value in classes],
-            up_class_index,
-            feature_order,
-            output_names,
-            prob_output_name,
-            0.0 if np.isnan(best["acc_hi"]) else float(best["acc_hi"]),
-            float(best["coverage"]),
-            float(best["acc_all"]),
-            len(train_val_x),
-            test_rows,
-            best_model_name,
-            best_params,
-            conf_threshold,
-            args.target_acc,
-            args.min_coverage,
-            0.0 if np.isnan(test_acc_hi) else float(test_acc_hi),
-            float(test_coverage),
-            float(test_acc_all),
-            val_rows,
-            export_fallback,
-        )
-        write_current(model_dir, args.out_dir, symbol)
-        wrote_path = args.out_dir / symbol / "current"
-        print(
-            "TRAIN_SYMBOL symbol={} rows={} wrote={}".format(
-                symbol,
-                len(train_val_x),
-                wrote_path,
+            print(
+                "FINAL symbol={} side={} testAccHi={} testOrders={} testDays={} testOrdersPerDay={:.6f}".format(
+                    symbol,
+                    side,
+                    "nan" if np.isnan(test_acc_hi) else f"{test_acc_hi:.6f}",
+                    test_orders,
+                    test_days,
+                    test_orders_per_day,
+                )
             )
-        )
+            model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+            model_dir = args.out_dir / symbol / f"{model_version}_{side}"
+            export_fallback = False
+            if args.eval_only:
+                print(
+                    "EVAL_ONLY symbol={} side={} train_rows={} val_rows={} test_rows={}".format(
+                        symbol, side, len(train_val_x), val_rows, test_rows
+                    )
+                )
+                continue
+            input_names, output_names = export_onnx(final_model, x.shape[1], model_dir / "model.onnx")
+            print(
+                "ONNX_EXPORT symbol={} side={} inputs={} outputs={}".format(
+                    symbol, side, input_names, output_names
+                )
+            )
+            prob_output_name = "probabilities" if "probabilities" in output_names else None
+            x_check = x.iloc[:256].to_numpy(dtype=np.float32)
+            check_onnx_outputs(symbol, model_dir / "model.onnx", x_check)
+            train_days = len(extract_dates(feature_files))
+            write_meta(
+                model_dir / "model_meta.json",
+                model_version,
+                symbol,
+                train_days,
+                len(train_val_x),
+                [int(value) for value in classes],
+                up_class_index,
+                feature_order,
+                output_names,
+                prob_output_name,
+                label_type,
+                best_params,
+                0.0 if np.isnan(val_acc_hi) else float(val_acc_hi),
+                float(val_coverage),
+                val_orders,
+                val_orders_per_day,
+                val_days,
+                val_rows,
+                0.0 if np.isnan(test_acc_hi) else float(test_acc_hi),
+                float(test_coverage),
+                test_orders,
+                test_orders_per_day,
+                test_days,
+                test_rows,
+                export_fallback,
+            )
+            write_current(model_dir, args.out_dir, symbol, side)
+            wrote_path = args.out_dir / symbol / f"current_{side}"
+            print(
+                "TRAIN_SYMBOL symbol={} side={} rows={} wrote={}".format(
+                    symbol,
+                    side,
+                    len(train_val_x),
+                    wrote_path,
+                )
+            )
 
 
 if __name__ == "__main__":

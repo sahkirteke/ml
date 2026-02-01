@@ -9,16 +9,15 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
         "symbol",
         "tf",
         "predCloseTimeMs",
-        "predCloseTime",
-        "predDecision",
-        "predPUp",
-        "actualCloseTimeMs",
-        "actualCloseTime",
-        "futureRet_1",
-        "actualUp",
+        "eventCloseTimeMs",
+        "direction",
+        "entryPrice",
+        "tpPrice",
+        "slPrice",
         "result",
-        "evaluatedAtMs",
-        "evaluatedAt"
+        "event",
+        "loggedAtMs",
+        "loggedAt"
 })
 public class EvalRecord {
 
@@ -26,16 +25,15 @@ public class EvalRecord {
     private String symbol;
     private String tf;
     private long predCloseTimeMs;
-    private String predCloseTime;
-    private String predDecision;
-    private Double predPUp;
-    private long actualCloseTimeMs;
-    private String actualCloseTime;
-    private Double futureRet_1;
-    private Boolean actualUp;
+    private long eventCloseTimeMs;
+    private String direction;
+    private Double entryPrice;
+    private Double tpPrice;
+    private Double slPrice;
     private String result;
-    private long evaluatedAtMs;
-    private String evaluatedAt;
+    private String event;
+    private long loggedAtMs;
+    private String loggedAt;
 
     public String getType() {
         return type;
@@ -69,60 +67,44 @@ public class EvalRecord {
         this.predCloseTimeMs = predCloseTimeMs;
     }
 
-    public String getPredCloseTime() {
-        return predCloseTime;
+    public long getEventCloseTimeMs() {
+        return eventCloseTimeMs;
     }
 
-    public void setPredCloseTime(String predCloseTime) {
-        this.predCloseTime = predCloseTime;
+    public void setEventCloseTimeMs(long eventCloseTimeMs) {
+        this.eventCloseTimeMs = eventCloseTimeMs;
     }
 
-    public String getPredDecision() {
-        return predDecision;
+    public String getDirection() {
+        return direction;
     }
 
-    public void setPredDecision(String predDecision) {
-        this.predDecision = predDecision;
+    public void setDirection(String direction) {
+        this.direction = direction;
     }
 
-    public Double getPredPUp() {
-        return predPUp;
+    public Double getEntryPrice() {
+        return entryPrice;
     }
 
-    public void setPredPUp(Double predPUp) {
-        this.predPUp = predPUp;
+    public void setEntryPrice(Double entryPrice) {
+        this.entryPrice = entryPrice;
     }
 
-    public long getActualCloseTimeMs() {
-        return actualCloseTimeMs;
+    public Double getTpPrice() {
+        return tpPrice;
     }
 
-    public void setActualCloseTimeMs(long actualCloseTimeMs) {
-        this.actualCloseTimeMs = actualCloseTimeMs;
+    public void setTpPrice(Double tpPrice) {
+        this.tpPrice = tpPrice;
     }
 
-    public String getActualCloseTime() {
-        return actualCloseTime;
+    public Double getSlPrice() {
+        return slPrice;
     }
 
-    public void setActualCloseTime(String actualCloseTime) {
-        this.actualCloseTime = actualCloseTime;
-    }
-
-    public Double getFutureRet_1() {
-        return futureRet_1;
-    }
-
-    public void setFutureRet_1(Double futureRet_1) {
-        this.futureRet_1 = futureRet_1;
-    }
-
-    public Boolean getActualUp() {
-        return actualUp;
-    }
-
-    public void setActualUp(Boolean actualUp) {
-        this.actualUp = actualUp;
+    public void setSlPrice(Double slPrice) {
+        this.slPrice = slPrice;
     }
 
     public String getResult() {
@@ -133,19 +115,27 @@ public class EvalRecord {
         this.result = result;
     }
 
-    public long getEvaluatedAtMs() {
-        return evaluatedAtMs;
+    public String getEvent() {
+        return event;
     }
 
-    public void setEvaluatedAtMs(long evaluatedAtMs) {
-        this.evaluatedAtMs = evaluatedAtMs;
+    public void setEvent(String event) {
+        this.event = event;
     }
 
-    public String getEvaluatedAt() {
-        return evaluatedAt;
+    public long getLoggedAtMs() {
+        return loggedAtMs;
     }
 
-    public void setEvaluatedAt(String evaluatedAt) {
-        this.evaluatedAt = evaluatedAt;
+    public void setLoggedAtMs(long loggedAtMs) {
+        this.loggedAtMs = loggedAtMs;
+    }
+
+    public String getLoggedAt() {
+        return loggedAt;
+    }
+
+    public void setLoggedAt(String loggedAt) {
+        this.loggedAt = loggedAt;
     }
 }

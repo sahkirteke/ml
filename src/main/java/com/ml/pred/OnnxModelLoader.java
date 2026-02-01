@@ -28,7 +28,7 @@ public class OnnxModelLoader {
     private final Path modelsBaseDir;
     private final ObjectMapper objectMapper;
     private final OrtEnvironment environment;
-    private final Map<String, ModelBundle> models = new ConcurrentHashMap<>();
+    private final Map<String, ModelPair> models = new ConcurrentHashMap<>();
     private final boolean smokeTestEnabled;
 
     public OnnxModelLoader(RawIngestionProperties properties, ObjectMapper objectMapper) {
@@ -39,24 +39,33 @@ public class OnnxModelLoader {
         log.info("MODELS_BASE_DIR path={}", modelsBaseDir);
     }
 
-    public Optional<ModelBundle> getModel(String symbol) {
+    public Optional<ModelPair> getModelPair(String symbol) {
         if (symbol == null || symbol.isBlank()) {
             return Optional.empty();
         }
         String key = symbol.toUpperCase();
-        ModelBundle bundle = models.computeIfAbsent(key, k -> new ModelBundle());
-        return loadIfNeeded(key, bundle);
+        ModelPair pair = models.computeIfAbsent(key, k -> new ModelPair());
+        return loadIfNeeded(key, pair);
     }
 
     @Scheduled(fixedDelay = 10_000L)
     public void checkAndReload() {
-        for (Map.Entry<String, ModelBundle> entry : models.entrySet()) {
+        for (Map.Entry<String, ModelPair> entry : models.entrySet()) {
             loadIfNeeded(entry.getKey(), entry.getValue());
         }
     }
 
-    private Optional<ModelBundle> loadIfNeeded(String symbol, ModelBundle bundle) {
-        Path modelDir = modelsBaseDir.resolve(symbol).resolve("current");
+    private Optional<ModelPair> loadIfNeeded(String symbol, ModelPair pair) {
+        Optional<ModelBundle> longModel = loadVariant(symbol, pair.longModel, "current_long");
+        Optional<ModelBundle> shortModel = loadVariant(symbol, pair.shortModel, "current_short");
+        if (longModel.isEmpty() || shortModel.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(pair);
+    }
+
+    private Optional<ModelBundle> loadVariant(String symbol, ModelBundle bundle, String variantDir) {
+        Path modelDir = modelsBaseDir.resolve(symbol).resolve(variantDir);
         Path modelPath = modelDir.resolve("model.onnx");
         Path metaPath = modelDir.resolve("model_meta.json");
         boolean modelExists = Files.exists(modelPath);
@@ -90,8 +99,9 @@ public class OnnxModelLoader {
             bundle.meta = meta;
             bundle.lastModelModified = modelModified;
             bundle.lastMetaModified = metaModified;
-            log.info("MODEL_LOADED symbol={} modelVersion={} nFeatures={}",
+            log.info("MODEL_LOADED symbol={} side={} modelVersion={} nFeatures={}",
                     symbol,
+                    variantDir,
                     meta.getModelVersion(),
                     meta.getFeatureOrder() == null ? 0 : meta.getFeatureOrder().size());
             logOutputInfo(symbol, session);
@@ -223,6 +233,19 @@ public class OnnxModelLoader {
 
         public ModelMeta getMeta() {
             return meta;
+        }
+    }
+
+    public static class ModelPair {
+        private final ModelBundle longModel = new ModelBundle();
+        private final ModelBundle shortModel = new ModelBundle();
+
+        public ModelBundle getLongModel() {
+            return longModel;
+        }
+
+        public ModelBundle getShortModel() {
+            return shortModel;
         }
     }
 }
