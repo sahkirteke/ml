@@ -18,9 +18,10 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
         "entryPrice",
         "tpPrice",
         "slPrice",
+        "pLongHit",
+        "pShortHit",
         "pHit",
         "pTrade",
-        "confidence",
         "loggedAtMs",
         "loggedAt"
 })
@@ -38,11 +39,14 @@ public class PredRecord {
     private Double entryPrice;
     private Double tpPrice;
     private Double slPrice;
+    @JsonProperty("pLongHit")
+    private Double pLongHit;
+    @JsonProperty("pShortHit")
+    private Double pShortHit;
     @JsonProperty("pHit")
     private Double pHit;
     @JsonProperty("pTrade")
     private Double pTrade;
-    private Double confidence;
     private long loggedAtMs;
     private String loggedAt;
 
@@ -142,6 +146,22 @@ public class PredRecord {
         this.slPrice = slPrice;
     }
 
+    public Double getPLongHit() {
+        return pLongHit;
+    }
+
+    public void setPLongHit(Double pLongHit) {
+        this.pLongHit = pLongHit;
+    }
+
+    public Double getPShortHit() {
+        return pShortHit;
+    }
+
+    public void setPShortHit(Double pShortHit) {
+        this.pShortHit = pShortHit;
+    }
+
     public Double getPHit() {
         return pHit;
     }
@@ -156,14 +176,6 @@ public class PredRecord {
 
     public void setPTrade(Double pTrade) {
         this.pTrade = pTrade;
-    }
-
-    public Double getConfidence() {
-        return confidence;
-    }
-
-    public void setConfidence(Double confidence) {
-        this.confidence = confidence;
     }
 
     public long getLoggedAtMs() {

@@ -1,10 +1,12 @@
 package com.ml.pred;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ml.config.RawIngestionProperties;
+import java.nio.FloatBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.FloatBuffer;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
@@ -28,7 +30,9 @@ public class OnnxModelLoader {
     private final Path modelsBaseDir;
     private final ObjectMapper objectMapper;
     private final OrtEnvironment environment;
-    private final Map<String, ModelPair> models = new ConcurrentHashMap<>();
+    private static final long MISSING_LOG_INTERVAL_MS = 300_000L;
+    private final Map<String, ModelState> models = new ConcurrentHashMap<>();
+    private final Map<String, Long> missingLogBySymbol = new ConcurrentHashMap<>();
     private final boolean smokeTestEnabled;
 
     public OnnxModelLoader(RawIngestionProperties properties, ObjectMapper objectMapper) {
@@ -39,84 +43,132 @@ public class OnnxModelLoader {
         log.info("MODELS_BASE_DIR path={}", modelsBaseDir);
     }
 
-    public Optional<ModelPair> getModelPair(String symbol) {
+    public Optional<ModelBundle> loadBundle(String symbol) {
         if (symbol == null || symbol.isBlank()) {
             return Optional.empty();
         }
         String key = symbol.toUpperCase();
-        ModelPair pair = models.computeIfAbsent(key, k -> new ModelPair());
-        return loadIfNeeded(key, pair);
+        ModelState state = models.computeIfAbsent(key, k -> new ModelState());
+        return loadIfNeeded(key, state);
     }
 
     @Scheduled(fixedDelay = 10_000L)
     public void checkAndReload() {
-        for (Map.Entry<String, ModelPair> entry : models.entrySet()) {
+        for (Map.Entry<String, ModelState> entry : models.entrySet()) {
             loadIfNeeded(entry.getKey(), entry.getValue());
         }
     }
 
-    private Optional<ModelPair> loadIfNeeded(String symbol, ModelPair pair) {
-        Optional<ModelBundle> longModel = loadVariant(symbol, pair.longModel, "current_long");
-        Optional<ModelBundle> shortModel = loadVariant(symbol, pair.shortModel, "current_short");
+    private Optional<ModelBundle> loadIfNeeded(String symbol, ModelState state) {
+        Path longDir = modelsBaseDir.resolve(symbol).resolve("current_long");
+        Path shortDir = modelsBaseDir.resolve(symbol).resolve("current_short");
+        boolean longReady = hasModelFiles(longDir);
+        boolean shortReady = hasModelFiles(shortDir);
+        if (!longReady && !shortReady) {
+            clearVariant(state.longModel);
+            clearVariant(state.shortModel);
+            Optional<ModelBundle> fallback = loadFallbackCurrent(symbol, state);
+            if (fallback.isPresent()) {
+                return fallback;
+            }
+            logMissingModel(symbol, "PRED_SKIP_NO_MODEL symbol=%s longDir=%s shortDir=%s"
+                    .formatted(symbol, longDir, shortDir));
+            return Optional.empty();
+        }
+        if (!longReady || !shortReady) {
+            if (!longReady) {
+                clearVariant(state.longModel);
+            }
+            if (!shortReady) {
+                clearVariant(state.shortModel);
+            }
+            clearVariant(state.fallbackModel);
+            String missing = longReady ? "SHORT" : "LONG";
+            logMissingModel(symbol, "PRED_SKIP_PARTIAL_MODEL symbol=%s missing=%s"
+                    .formatted(symbol, missing));
+            return Optional.empty();
+        }
+        clearVariant(state.fallbackModel);
+        Optional<ModelVariant> longModel = loadVariant(symbol, state.longModel, longDir, "LONG");
+        Optional<ModelVariant> shortModel = loadVariant(symbol, state.shortModel, shortDir, "SHORT");
         if (longModel.isEmpty() || shortModel.isEmpty()) {
             return Optional.empty();
         }
-        return Optional.of(pair);
+        ModelVariant longVariant = longModel.get();
+        ModelVariant shortVariant = shortModel.get();
+        return Optional.of(new ModelBundle(
+                longVariant.session,
+                longVariant.meta,
+                shortVariant.session,
+                shortVariant.meta));
     }
 
-    private Optional<ModelBundle> loadVariant(String symbol, ModelBundle bundle, String variantDir) {
-        Path modelDir = modelsBaseDir.resolve(symbol).resolve(variantDir);
+    private boolean hasModelFiles(Path modelDir) {
+        return Files.exists(modelDir.resolve("model.onnx")) && Files.exists(modelDir.resolve("model_meta.json"));
+    }
+
+    private Optional<ModelVariant> loadVariant(String symbol, ModelVariant variant, Path modelDir, String side) {
+        return loadVariant(symbol, variant, modelDir, side, true);
+    }
+
+    private Optional<ModelVariant> loadVariant(
+            String symbol,
+            ModelVariant variant,
+            Path modelDir,
+            String side,
+            boolean logFailures
+    ) {
         Path modelPath = modelDir.resolve("model.onnx");
         Path metaPath = modelDir.resolve("model_meta.json");
-        boolean modelExists = Files.exists(modelPath);
-        boolean metaExists = Files.exists(metaPath);
-        if (!modelExists || !metaExists) {
-            closeQuietly(bundle.session);
-            bundle.session = null;
-            bundle.meta = null;
-            bundle.lastModelModified = -1L;
-            bundle.lastMetaModified = -1L;
-            if (!bundle.missingLogged) {
-                log.info("PRED_SKIP_NO_MODEL symbol={} modelDir={}", symbol, modelDir);
-                bundle.missingLogged = true;
-            }
-            return Optional.empty();
-        }
-        bundle.missingLogged = false;
         try {
             long modelModified = Files.getLastModifiedTime(modelPath).toMillis();
             long metaModified = Files.getLastModifiedTime(metaPath).toMillis();
-            if (modelModified == bundle.lastModelModified
-                    && metaModified == bundle.lastMetaModified
-                    && bundle.session != null
-                    && bundle.meta != null) {
-                return Optional.of(bundle);
+            if (modelModified == variant.lastModelModified
+                    && metaModified == variant.lastMetaModified
+                    && variant.session != null
+                    && variant.meta != null) {
+                return Optional.of(variant);
             }
-            ModelMeta meta = objectMapper.readValue(metaPath.toFile(), ModelMeta.class);
-            closeQuietly(bundle.session);
+            ModelMeta meta = readMeta(metaPath);
+            closeQuietly(variant.session);
             OrtSession session = environment.createSession(modelPath.toString(), new OrtSession.SessionOptions());
-            bundle.session = session;
-            bundle.meta = meta;
-            bundle.lastModelModified = modelModified;
-            bundle.lastMetaModified = metaModified;
+            variant.session = session;
+            variant.meta = meta;
+            variant.lastModelModified = modelModified;
+            variant.lastMetaModified = metaModified;
             log.info("MODEL_LOADED symbol={} side={} modelVersion={} nFeatures={}",
                     symbol,
-                    variantDir,
-                    meta.getModelVersion(),
+                    side,
+                    resolveModelVersion(meta),
                     meta.getFeatureOrder() == null ? 0 : meta.getFeatureOrder().size());
             logOutputInfo(symbol, session);
             if (smokeTestEnabled) {
                 runSmokeTest(symbol, meta, session);
             }
-            return Optional.of(bundle);
+            return Optional.of(variant);
         } catch (Exception ex) {
-            log.info("PRED_SKIP_NO_MODEL symbol={} modelDir={} error=load_failed", symbol, modelDir, ex);
-            closeQuietly(bundle.session);
-            bundle.session = null;
-            bundle.meta = null;
-            bundle.lastModelModified = -1L;
-            bundle.lastMetaModified = -1L;
+            if (logFailures) {
+                log.info("PRED_SKIP_NO_MODEL symbol={} modelDir={} error=load_failed", symbol, modelDir, ex);
+            }
+            clearVariant(variant);
             return Optional.empty();
+        }
+    }
+
+    private void clearVariant(ModelVariant variant) {
+        closeQuietly(variant.session);
+        variant.session = null;
+        variant.meta = null;
+        variant.lastModelModified = -1L;
+        variant.lastMetaModified = -1L;
+    }
+
+    private void logMissingModel(String symbol, String message) {
+        long now = System.currentTimeMillis();
+        Long last = missingLogBySymbol.get(symbol);
+        if (last == null || now - last >= MISSING_LOG_INTERVAL_MS) {
+            missingLogBySymbol.put(symbol, now);
+            log.info(message);
         }
     }
 
@@ -185,14 +237,18 @@ public class OnnxModelLoader {
         }
     }
 
-    private String resolveProbOutputName(ModelMeta meta, OrtSession session) {
-        if (meta.getProbOutputName() != null && session.getOutputNames().contains(meta.getProbOutputName())) {
-            return meta.getProbOutputName();
-        }
+    private String resolveProbOutputName(OrtSession session) {
         if (session.getOutputNames().contains("probabilities")) {
             return "probabilities";
         }
         return session.getOutputNames().iterator().next();
+    }
+
+    private String resolveProbOutputName(ModelMeta meta, OrtSession session) {
+        if (meta.getProbOutputName() != null && session.getOutputNames().contains(meta.getProbOutputName())) {
+            return meta.getProbOutputName();
+        }
+        return resolveProbOutputName(session);
     }
 
     private float[] extractProbabilities(OrtSession.Result result, String outputName, Integer upIndex) {
@@ -220,32 +276,68 @@ public class OnnxModelLoader {
         return new float[0];
     }
 
-    public static class ModelBundle {
+    public record ModelBundle(
+            OrtSession longSession,
+            ModelMeta longMeta,
+            OrtSession shortSession,
+            ModelMeta shortMeta
+    ) {}
+
+    private static final class ModelVariant {
         private OrtSession session;
         private ModelMeta meta;
         private long lastModelModified = -1L;
         private long lastMetaModified = -1L;
-        private boolean missingLogged = false;
+    }
 
-        public OrtSession getSession() {
-            return session;
+    private static final class ModelState {
+        private final ModelVariant longModel = new ModelVariant();
+        private final ModelVariant shortModel = new ModelVariant();
+        private final ModelVariant fallbackModel = new ModelVariant();
+    }
+
+    private Optional<ModelBundle> loadFallbackCurrent(String symbol, ModelState state) {
+        Path currentDir = modelsBaseDir.resolve(symbol).resolve("current");
+        if (!hasModelFiles(currentDir)) {
+            clearVariant(state.fallbackModel);
+            return Optional.empty();
         }
+        Optional<ModelVariant> fallback = loadVariant(symbol, state.fallbackModel, currentDir, "FALLBACK", false);
+        if (fallback.isEmpty()) {
+            return Optional.empty();
+        }
+        ModelVariant variant = fallback.get();
+        return Optional.of(new ModelBundle(
+                variant.session,
+                variant.meta,
+                variant.session,
+                variant.meta));
+    }
 
-        public ModelMeta getMeta() {
+    private ModelMeta readMeta(Path metaPath) throws Exception {
+        try {
+            return objectMapper.readValue(metaPath.toFile(), ModelMeta.class);
+        } catch (Exception ex) {
+            Map<String, Object> fallback = objectMapper.readValue(metaPath.toFile(), new TypeReference<>() {});
+            ModelMeta meta = new ModelMeta();
+            Object featureOrder = fallback.get("featureOrder");
+            if (featureOrder instanceof List<?> list) {
+                meta.setFeatureOrder(list.stream().map(String::valueOf).toList());
+            }
+            if (fallback.get("probOutputName") != null) {
+                meta.setProbOutputName(String.valueOf(fallback.get("probOutputName")));
+            }
+            if (fallback.get("upClassIndex") instanceof Number number) {
+                meta.setUpClassIndex(number.intValue());
+            }
+            if (fallback.get("modelVersion") != null) {
+                meta.setModelVersion(String.valueOf(fallback.get("modelVersion")));
+            }
             return meta;
         }
     }
 
-    public static class ModelPair {
-        private final ModelBundle longModel = new ModelBundle();
-        private final ModelBundle shortModel = new ModelBundle();
-
-        public ModelBundle getLongModel() {
-            return longModel;
-        }
-
-        public ModelBundle getShortModel() {
-            return shortModel;
-        }
+    private String resolveModelVersion(ModelMeta meta) {
+        return meta == null ? null : meta.getModelVersion();
     }
 }

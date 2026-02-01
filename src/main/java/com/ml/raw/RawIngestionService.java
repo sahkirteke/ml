@@ -43,6 +43,7 @@ public class RawIngestionService implements ApplicationRunner {
     private static final double SL_PCT = 0.002d;
     private static final double P_TRADE = 0.55d;
     private static final int HORIZON_BARS = 7;
+    private static final long GAP_MS = 300_000L;
 
     private final BinanceWsClient wsClient;
     private final RawRecordBuilder recordBuilder;
@@ -57,6 +58,7 @@ public class RawIngestionService implements ApplicationRunner {
     private final PredWriter predWriter;
     private final RawIngestionProperties properties;
     private final Map<String, PendingTrade> pendingBySymbol = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastCloseTimeMsBySymbol = new ConcurrentHashMap<>();
 
     public RawIngestionService(
             BinanceWsClient wsClient,
@@ -147,6 +149,10 @@ public class RawIngestionService implements ApplicationRunner {
                                 symbolState.getLastFeaturesCloseTimeMs(symbol));
                     }
                 }
+                if (handleGap(symbol, record.getCloseTimeMs())) {
+                    pendingBySymbol.remove(symbol);
+                    return;
+                }
                 evaluatePendingWithBar(symbol, previous, record);
                 if (featureRecord != null && !pendingBySymbol.containsKey(symbol)) {
                     writePrediction(symbol, featureRecord);
@@ -165,14 +171,20 @@ public class RawIngestionService implements ApplicationRunner {
         if (featureRecord.getCloseTimeMs() <= lastPred) {
             return;
         }
-        Optional<OnnxModelLoader.ModelPair> modelOpt = onnxModelLoader.getModelPair(symbol);
+        Optional<OnnxModelLoader.ModelBundle> modelOpt = onnxModelLoader.loadBundle(symbol);
         if (modelOpt.isEmpty()) {
             return;
         }
-        OnnxModelLoader.ModelPair modelPair = modelOpt.get();
+        OnnxModelLoader.ModelBundle modelBundle = modelOpt.get();
         try {
-            Optional<Double> pLongOpt = onnxInferenceService.predict(featureRecord, modelPair.getLongModel());
-            Optional<Double> pShortOpt = onnxInferenceService.predict(featureRecord, modelPair.getShortModel());
+            Optional<Double> pLongOpt = onnxInferenceService.predict(
+                    featureRecord,
+                    modelBundle.longSession(),
+                    modelBundle.longMeta());
+            Optional<Double> pShortOpt = onnxInferenceService.predict(
+                    featureRecord,
+                    modelBundle.shortSession(),
+                    modelBundle.shortMeta());
             if (pLongOpt.isEmpty() || pShortOpt.isEmpty()) {
                 return;
             }
@@ -182,8 +194,8 @@ public class RawIngestionService implements ApplicationRunner {
             if (best < P_TRADE) {
                 return;
             }
-            String direction = pLongHit > pShortHit ? "UP" : "DOWN";
-            double pHit = direction.equals("UP") ? pLongHit : pShortHit;
+            String direction = pLongHit >= pShortHit ? "UP" : "DOWN";
+            double pHit = best;
             PredRecord predRecord = new PredRecord();
             predRecord.setType("PRED");
             predRecord.setSymbol(symbol);
@@ -195,11 +207,11 @@ public class RawIngestionService implements ApplicationRunner {
             predRecord.setSlPct(SL_PCT);
             predRecord.setDirection(direction);
             predRecord.setPHit(pHit);
+            predRecord.setPLongHit(pLongHit);
+            predRecord.setPShortHit(pShortHit);
             predRecord.setPTrade(P_TRADE);
             predRecord.setLoggedAtMs(System.currentTimeMillis());
             predRecord.setLoggedAt(formatMs(predRecord.getLoggedAtMs()));
-            double conf = Math.max(pHit, 1.0d - pHit);
-            predRecord.setConfidence(conf);
             double entryPrice = parseDouble(featureRecord.getClosePrice());
             if (entryPrice <= 0.0d) {
                 return;
@@ -214,19 +226,17 @@ public class RawIngestionService implements ApplicationRunner {
             }
             predWriter.append(predRecord);
             log.info(
-                    "PRED symbol={} closeTimeMs={} direction={} pHit={} pTrade={} conf={}",
+                    "PRED symbol={} closeTimeMs={} direction={} pHit={} pTrade={}",
                     symbol,
                     featureRecord.getCloseTimeMs(),
                     direction,
                     pHit,
-                    P_TRADE,
-                    conf,
-                    conf);
+                    P_TRADE);
             symbolState.updatePredIfNewer(symbol, featureRecord.getCloseTimeMs());
             symbolState.setLastPredInfo(symbol, predRecord.getDirection(), pHit);
             enqueuePending(symbol, featureRecord, predRecord);
         } catch (Exception ex) {
-            log.info("PRED_SKIP_NO_MODEL symbol={} closeTimeMs={}", symbol, featureRecord.getCloseTimeMs(), ex);
+            log.info("PRED_SKIP_INFER symbol={} closeTimeMs={} error=exception", symbol, featureRecord.getCloseTimeMs(), ex);
         }
     }
 
@@ -236,12 +246,6 @@ public class RawIngestionService implements ApplicationRunner {
         }
         PendingTrade pending = pendingBySymbol.get(symbol);
         if (pending == null) {
-            return;
-        }
-        long expectedGap = properties.getExpectedGapMs() == null ? 300_000L : properties.getExpectedGapMs();
-        long gapMs = current.getCloseTimeMs() - previous.getCloseTimeMs();
-        if (gapMs != expectedGap) {
-            pendingBySymbol.remove(symbol);
             return;
         }
         double barHigh = parseDouble(current.getHighPrice());
@@ -330,15 +334,8 @@ public class RawIngestionService implements ApplicationRunner {
             return null;
         }
         double futureRet = currentClose / prevClose - 1.0d;
-        long expectedGap = properties.getExpectedGapMs() == null ? 300_000L : properties.getExpectedGapMs();
         long gapMs = current.getCloseTimeMs() - previous.getCloseTimeMs();
-        if (gapMs != expectedGap) {
-            log.info("SKIP_GAP_LABEL symbol={} prevCloseTimeMs={} closeTimeMs={} gapMs={} expectedGapMs={}",
-                    current.getSymbol(),
-                    previous.getCloseTimeMs(),
-                    current.getCloseTimeMs(),
-                    gapMs,
-                    expectedGap);
+        if (gapMs != GAP_MS) {
             return null;
         }
         LabelRecord label = new LabelRecord();
@@ -382,6 +379,24 @@ public class RawIngestionService implements ApplicationRunner {
         return Instant.ofEpochMilli(epochMs)
                 .atZone(ISTANBUL_ZONE)
                 .format(ISO_FORMATTER);
+    }
+
+    private boolean handleGap(String symbol, long closeTimeMs) {
+        Long prev = lastCloseTimeMsBySymbol.get(symbol);
+        if (prev != null) {
+            long gapMs = closeTimeMs - prev;
+            if (gapMs != GAP_MS) {
+                log.info("GAP_DETECTED_SKIP_INFER symbol={} prev={} now={} gapMs={}",
+                        symbol,
+                        prev,
+                        closeTimeMs,
+                        gapMs);
+                lastCloseTimeMsBySymbol.put(symbol, closeTimeMs);
+                return true;
+            }
+        }
+        lastCloseTimeMsBySymbol.put(symbol, closeTimeMs);
+        return false;
     }
 
     private static final class PendingTrade {
