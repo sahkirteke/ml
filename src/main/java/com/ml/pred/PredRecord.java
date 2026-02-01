@@ -1,6 +1,7 @@
 package com.ml.pred;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -10,19 +11,16 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
         "tf",
         "closeTimeMs",
         "closeTime",
-        "featuresVersion",
-        "modelVersion",
-        "pUp",
+        "horizonBars",
+        "tpPct",
+        "slPct",
+        "direction",
+        "entryPrice",
+        "tpPrice",
+        "slPrice",
+        "pHit",
+        "pTrade",
         "confidence",
-        "edgeAbs",
-        "expectedPct",
-        "expectedBp",
-        "minConfidence",
-        "minAbsExpectedPct",
-        "minAbsEdge",
-        "decision",
-        "decisionReason",
-        "failedGate",
         "loggedAtMs",
         "loggedAt"
 })
@@ -33,19 +31,18 @@ public class PredRecord {
     private String tf;
     private long closeTimeMs;
     private String closeTime;
-    private String featuresVersion;
-    private String modelVersion;
-    private double pUp;
+    private Integer horizonBars;
+    private Double tpPct;
+    private Double slPct;
+    private String direction;
+    private Double entryPrice;
+    private Double tpPrice;
+    private Double slPrice;
+    @JsonProperty("pHit")
+    private Double pHit;
+    @JsonProperty("pTrade")
+    private Double pTrade;
     private Double confidence;
-    private Double edgeAbs;
-    private Double expectedPct;
-    private Double expectedBp;
-    private Double minConfidence;
-    private Double minAbsExpectedPct;
-    private Double minAbsEdge;
-    private String decision;
-    private String decisionReason;
-    private String failedGate;
     private long loggedAtMs;
     private String loggedAt;
 
@@ -89,28 +86,76 @@ public class PredRecord {
         this.closeTime = closeTime;
     }
 
-    public String getFeaturesVersion() {
-        return featuresVersion;
+    public Integer getHorizonBars() {
+        return horizonBars;
     }
 
-    public void setFeaturesVersion(String featuresVersion) {
-        this.featuresVersion = featuresVersion;
+    public void setHorizonBars(Integer horizonBars) {
+        this.horizonBars = horizonBars;
     }
 
-    public String getModelVersion() {
-        return modelVersion;
+    public Double getTpPct() {
+        return tpPct;
     }
 
-    public void setModelVersion(String modelVersion) {
-        this.modelVersion = modelVersion;
+    public void setTpPct(Double tpPct) {
+        this.tpPct = tpPct;
     }
 
-    public double getPUp() {
-        return pUp;
+    public Double getSlPct() {
+        return slPct;
     }
 
-    public void setPUp(double pUp) {
-        this.pUp = pUp;
+    public void setSlPct(Double slPct) {
+        this.slPct = slPct;
+    }
+
+    public String getDirection() {
+        return direction;
+    }
+
+    public void setDirection(String direction) {
+        this.direction = direction;
+    }
+
+    public Double getEntryPrice() {
+        return entryPrice;
+    }
+
+    public void setEntryPrice(Double entryPrice) {
+        this.entryPrice = entryPrice;
+    }
+
+    public Double getTpPrice() {
+        return tpPrice;
+    }
+
+    public void setTpPrice(Double tpPrice) {
+        this.tpPrice = tpPrice;
+    }
+
+    public Double getSlPrice() {
+        return slPrice;
+    }
+
+    public void setSlPrice(Double slPrice) {
+        this.slPrice = slPrice;
+    }
+
+    public Double getPHit() {
+        return pHit;
+    }
+
+    public void setPHit(Double pHit) {
+        this.pHit = pHit;
+    }
+
+    public Double getPTrade() {
+        return pTrade;
+    }
+
+    public void setPTrade(Double pTrade) {
+        this.pTrade = pTrade;
     }
 
     public Double getConfidence() {
@@ -119,78 +164,6 @@ public class PredRecord {
 
     public void setConfidence(Double confidence) {
         this.confidence = confidence;
-    }
-
-    public Double getEdgeAbs() {
-        return edgeAbs;
-    }
-
-    public void setEdgeAbs(Double edgeAbs) {
-        this.edgeAbs = edgeAbs;
-    }
-
-    public Double getExpectedPct() {
-        return expectedPct;
-    }
-
-    public void setExpectedPct(Double expectedPct) {
-        this.expectedPct = expectedPct;
-    }
-
-    public Double getExpectedBp() {
-        return expectedBp;
-    }
-
-    public void setExpectedBp(Double expectedBp) {
-        this.expectedBp = expectedBp;
-    }
-
-    public Double getMinConfidence() {
-        return minConfidence;
-    }
-
-    public void setMinConfidence(Double minConfidence) {
-        this.minConfidence = minConfidence;
-    }
-
-    public Double getMinAbsExpectedPct() {
-        return minAbsExpectedPct;
-    }
-
-    public void setMinAbsExpectedPct(Double minAbsExpectedPct) {
-        this.minAbsExpectedPct = minAbsExpectedPct;
-    }
-
-    public Double getMinAbsEdge() {
-        return minAbsEdge;
-    }
-
-    public void setMinAbsEdge(Double minAbsEdge) {
-        this.minAbsEdge = minAbsEdge;
-    }
-
-    public String getDecision() {
-        return decision;
-    }
-
-    public void setDecision(String decision) {
-        this.decision = decision;
-    }
-
-    public String getDecisionReason() {
-        return decisionReason;
-    }
-
-    public void setDecisionReason(String decisionReason) {
-        this.decisionReason = decisionReason;
-    }
-
-    public String getFailedGate() {
-        return failedGate;
-    }
-
-    public void setFailedGate(String failedGate) {
-        this.failedGate = failedGate;
     }
 
     public long getLoggedAtMs() {

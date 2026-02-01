@@ -4,7 +4,6 @@ import argparse
 import itertools
 import json
 import math
-import random
 import re
 import time
 import warnings
@@ -15,13 +14,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from skl2onnx import convert_sklearn
@@ -50,12 +44,12 @@ FEATURE_ORDER = [
 ]
 
 FEATURES_VERSION = "ftr_5m_v1"
-LABEL_TYPE = "tp0_004_sl0_002_within_7_tp_before_sl"
 MAX_HORIZON_BARS = 7
 TP_PCT = 0.004
 SL_PCT = 0.002
 GAP_MS = 300000
 CONF_THRESHOLD = 0.55
+P_TRADE = 0.55
 TRAIN_LIMIT = 400000
 
 
@@ -74,6 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-acc", default=0.65, type=float, help="Target accHi to stop tuning")
     parser.add_argument("--min-coverage", default=0.0002, type=float, help="Minimum coverage to stop tuning")
     parser.add_argument("--conf-threshold", default=CONF_THRESHOLD, type=float, help="Confidence threshold")
+    parser.add_argument("--min-orders-per-day", default=7.0, type=float, help="Minimum orders per day")
+    parser.add_argument("--min-total-orders", default=500, type=int, help="Minimum total orders in validation")
     parser.add_argument("--eval-only", action="store_true", help="Only run evaluation (skip export)")
     parser.add_argument("--fast-tail", action="store_true", help="Read only the latest rows needed")
     return parser.parse_args()
@@ -128,6 +124,10 @@ def resolve_istanbul_tz():
                 "ZoneInfo is required for --exclude-today; install backports.zoneinfo for Python < 3.9."
             ) from exc
     return ZoneInfo("Europe/Istanbul")
+
+
+def format_ms(epoch_ms: int) -> str:
+    return datetime.utcfromtimestamp(epoch_ms / 1000.0).isoformat() + "Z"
 
 
 def load_feature_frames(
@@ -192,7 +192,67 @@ def load_raw_frames(
     return raw, selected_files
 
 
-def build_labels_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+def outcome_long(
+    close_time: np.ndarray,
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    idx: int,
+) -> tuple[int, int, str] | None:
+    entry = close[idx]
+    if np.isnan(entry):
+        return None
+    tp_price = entry * (1.0 + TP_PCT)
+    sl_price = entry * (1.0 - SL_PCT)
+    for k in range(1, MAX_HORIZON_BARS + 1):
+        if close_time[idx + k] - close_time[idx + k - 1] != GAP_MS:
+            return None
+        hi = high[idx + k]
+        lo = low[idx + k]
+        if np.isnan(hi) or np.isnan(lo):
+            return None
+        hit_tp = hi >= tp_price
+        hit_sl = lo <= sl_price
+        if hit_tp and hit_sl:
+            return 0, k, "SL_HIT_SAME_BAR"
+        if hit_sl:
+            return 0, k, "SL_HIT"
+        if hit_tp:
+            return 1, k, "TP_HIT"
+    return None
+
+
+def outcome_short(
+    close_time: np.ndarray,
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    idx: int,
+) -> tuple[int, int, str] | None:
+    entry = close[idx]
+    if np.isnan(entry):
+        return None
+    tp_price = entry * (1.0 - TP_PCT)
+    sl_price = entry * (1.0 + SL_PCT)
+    for k in range(1, MAX_HORIZON_BARS + 1):
+        if close_time[idx + k] - close_time[idx + k - 1] != GAP_MS:
+            return None
+        hi = high[idx + k]
+        lo = low[idx + k]
+        if np.isnan(hi) or np.isnan(lo):
+            return None
+        hit_tp = lo <= tp_price
+        hit_sl = hi >= sl_price
+        if hit_tp and hit_sl:
+            return 0, k, "SL_HIT_SAME_BAR"
+        if hit_sl:
+            return 0, k, "SL_HIT"
+        if hit_tp:
+            return 1, k, "TP_HIT"
+    return None
+
+
+def build_labels_from_raw(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     required_columns = ["closeTimeMs", "highPrice", "lowPrice", "closePrice"]
     missing = [col for col in required_columns if col not in raw.columns]
     if missing:
@@ -202,107 +262,302 @@ def build_labels_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
     high = pd.to_numeric(raw_sorted["highPrice"], errors="coerce").to_numpy(dtype=np.float64)
     low = pd.to_numeric(raw_sorted["lowPrice"], errors="coerce").to_numpy(dtype=np.float64)
     close = pd.to_numeric(raw_sorted["closePrice"], errors="coerce").to_numpy(dtype=np.float64)
-    records: list[dict[str, object]] = []
-    gap_ok = np.diff(close_time) == GAP_MS
+    long_records: list[dict[str, object]] = []
+    short_records: list[dict[str, object]] = []
     for idx in range(len(raw_sorted) - MAX_HORIZON_BARS):
-        if np.isnan(close_time[idx]) or np.isnan(close[idx]):
+        if np.isnan(close_time[idx]):
             continue
-        if not gap_ok[idx : idx + MAX_HORIZON_BARS].all():
+        long_outcome = outcome_long(close_time, close, high, low, idx)
+        short_outcome = outcome_short(close_time, close, high, low, idx)
+        if long_outcome is None and short_outcome is None:
             continue
-        entry = close[idx]
-        tp_price = entry * (1.0 + TP_PCT)
-        sl_price = entry * (1.0 - SL_PCT)
-        label_hit = 0
-        event = "NO_TP"
-        time_to_event: int | None = None
-        invalid = False
-        for k in range(1, MAX_HORIZON_BARS + 1):
-            hi = high[idx + k]
-            lo = low[idx + k]
-            if np.isnan(hi) or np.isnan(lo):
-                invalid = True
-                break
-            hit_tp = hi >= tp_price
-            hit_sl = lo <= sl_price
-            if hit_tp and hit_sl:
-                label_hit = 0
-                event = "SL_FIRST"
-                time_to_event = k
-                break
-            if hit_sl:
-                label_hit = 0
-                event = "SL_FIRST"
-                time_to_event = k
-                break
-            if hit_tp:
-                label_hit = 1
-                event = "TP_FIRST"
-                time_to_event = k
-                break
-        if invalid:
-            continue
-        record: dict[str, object] = {
+        base_record: dict[str, object] = {
             "closeTimeMs": int(close_time[idx]),
-            "labelType": LABEL_TYPE,
-            "labelHit": int(label_hit),
-            "event": event,
-            "timeToEvent": time_to_event,
             "tpPct": TP_PCT,
             "slPct": SL_PCT,
             "maxHorizonBars": MAX_HORIZON_BARS,
         }
         if "symbol" in raw_sorted.columns:
-            record["symbol"] = raw_sorted.at[idx, "symbol"]
+            base_record["symbol"] = raw_sorted.at[idx, "symbol"]
         if "tf" in raw_sorted.columns:
-            record["tf"] = raw_sorted.at[idx, "tf"]
-        records.append(record)
-    if not records:
-        return pd.DataFrame()
-    return pd.DataFrame(records)
+            base_record["tf"] = raw_sorted.at[idx, "tf"]
+        if long_outcome is not None:
+            label_hit, time_to_event, event = long_outcome
+            record = dict(base_record)
+            record.update(
+                {
+                    "labelType": "tp0_004_sl0_002_within_7_event_driven_LONG",
+                    "labelHit": int(label_hit),
+                    "timeToEvent": int(time_to_event),
+                    "event": event,
+                }
+            )
+            long_records.append(record)
+        if short_outcome is not None:
+            label_hit, time_to_event, event = short_outcome
+            record = dict(base_record)
+            record.update(
+                {
+                    "labelType": "tp0_004_sl0_002_within_7_event_driven_SHORT",
+                    "labelHit": int(label_hit),
+                    "timeToEvent": int(time_to_event),
+                    "event": event,
+                }
+            )
+            short_records.append(record)
+    return pd.DataFrame(long_records), pd.DataFrame(short_records)
 
 
-def build_training_frame(
+def build_training_frames(
     features: pd.DataFrame, raw: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, list[str]]:
+) -> tuple[
+    tuple[pd.DataFrame, pd.Series, np.ndarray],
+    tuple[pd.DataFrame, pd.Series, np.ndarray],
+    list[str],
+]:
     features_filtered = features[(features["windowReady"] == True) & (features["featuresVersion"] == FEATURES_VERSION)]
     if features_filtered.empty:
         raise RuntimeError("No rows available after filtering features")
     if raw.empty:
         raise RuntimeError("Raw data required for label generation is empty")
-    label_frame = build_labels_from_raw(raw)
-    if label_frame.empty:
+    long_labels, short_labels = build_labels_from_raw(raw)
+    if long_labels.empty and short_labels.empty:
         raise RuntimeError("No rows available after labeling")
-    if "symbol" not in label_frame.columns:
-        if "symbol" in features_filtered.columns and features_filtered["symbol"].nunique() == 1:
-            label_frame["symbol"] = features_filtered["symbol"].iloc[0]
-        else:
-            raise RuntimeError("Label data missing symbol for join")
-    if "tf" not in label_frame.columns:
-        if "tf" in features_filtered.columns and features_filtered["tf"].nunique() == 1:
-            label_frame["tf"] = features_filtered["tf"].iloc[0]
-        else:
-            raise RuntimeError("Label data missing tf for join")
-    merged = features_filtered.merge(
-        label_frame,
+    def ensure_symbol_tf(labels: pd.DataFrame) -> pd.DataFrame:
+        if labels.empty:
+            return labels
+        if "symbol" not in labels.columns:
+            if "symbol" in features_filtered.columns and features_filtered["symbol"].nunique() == 1:
+                labels = labels.copy()
+                labels["symbol"] = features_filtered["symbol"].iloc[0]
+            else:
+                raise RuntimeError("Label data missing symbol for join")
+        if "tf" not in labels.columns:
+            if "tf" in features_filtered.columns and features_filtered["tf"].nunique() == 1:
+                labels = labels.copy()
+                labels["tf"] = features_filtered["tf"].iloc[0]
+            else:
+                raise RuntimeError("Label data missing tf for join")
+        return labels
+
+    long_labels = ensure_symbol_tf(long_labels)
+    short_labels = ensure_symbol_tf(short_labels)
+    merged_long = features_filtered.merge(
+        long_labels,
         on=["symbol", "tf", "closeTimeMs"],
         how="inner",
-    )
-    if merged.empty:
+    ).sort_values("closeTimeMs").reset_index(drop=True)
+    merged_short = features_filtered.merge(
+        short_labels,
+        on=["symbol", "tf", "closeTimeMs"],
+        how="inner",
+    ).sort_values("closeTimeMs").reset_index(drop=True)
+    if merged_long.empty and merged_short.empty:
         raise RuntimeError("No rows available after joining features and labels")
-    merged = merged.sort_values("closeTimeMs").reset_index(drop=True)
-    missing_features = [col for col in FEATURE_ORDER if col not in merged.columns]
+    missing_features = [col for col in FEATURE_ORDER if col not in features_filtered.columns]
     if missing_features:
         raise RuntimeError(f"Missing expected feature columns: {missing_features}")
-    x = merged[FEATURE_ORDER].copy()
-    x = x.apply(pd.to_numeric, errors="coerce")
-    x.replace([np.inf, -np.inf], np.nan, inplace=True)
-    x = x.astype(np.float32)
-    y = merged["labelHit"].astype(int)
-    stds = x.std(axis=0, skipna=True)
-    keep_cols = [col for col in x.columns if stds[col] > 0]
-    if keep_cols and len(keep_cols) != len(x.columns):
-        x = x[keep_cols].copy()
-    return x, y, merged, list(x.columns)
+
+    def build_xy(merged: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, np.ndarray]:
+        if merged.empty:
+            return pd.DataFrame(), pd.Series(dtype=int), np.array([])
+        x = merged[FEATURE_ORDER].copy()
+        x = x.apply(pd.to_numeric, errors="coerce")
+        x.replace([np.inf, -np.inf], np.nan, inplace=True)
+        x = x.astype(np.float32)
+        stds = x.std(axis=0, skipna=True)
+        keep_cols = [col for col in x.columns if stds[col] > 0]
+        if keep_cols and len(keep_cols) != len(x.columns):
+            x = x[keep_cols].copy()
+        y = merged["labelHit"].astype(int)
+        close_times = pd.to_numeric(merged["closeTimeMs"], errors="coerce").to_numpy(dtype=np.float64)
+        return x, y, close_times
+
+    x_long, y_long, close_long = build_xy(merged_long)
+    x_short, y_short, close_short = build_xy(merged_short)
+    feature_order = list(x_long.columns if not x_long.empty else x_short.columns)
+    return (x_long, y_long, close_long), (x_short, y_short, close_short), feature_order
+
+
+def simulate_trade_only(
+    symbol: str,
+    raw_df: pd.DataFrame,
+    feat_df: pd.DataFrame,
+    model_long,
+    model_short,
+    out_pred_path: Path,
+    *,
+    conf_thr: float = CONF_THRESHOLD,
+    p_trade: float = P_TRADE,
+    horizon_bars: int = MAX_HORIZON_BARS,
+) -> dict:
+    raw_sorted = raw_df.sort_values("closeTimeMs").copy()
+    feat_sorted = feat_df.sort_values("closeTimeMs").copy()
+    raw_sorted["close"] = pd.to_numeric(raw_sorted["closePrice"], errors="coerce")
+    raw_sorted["high"] = pd.to_numeric(raw_sorted["highPrice"], errors="coerce")
+    raw_sorted["low"] = pd.to_numeric(raw_sorted["lowPrice"], errors="coerce")
+    joined = feat_sorted.merge(
+        raw_sorted[["closeTimeMs", "close", "high", "low"]],
+        on="closeTimeMs",
+        how="inner",
+    )
+    joined = joined[joined["windowReady"] == True].copy()
+    if joined.empty:
+        return {
+            "predCount": 0,
+            "evalCount": 0,
+            "okCount": 0,
+            "nokCount": 0,
+            "winrate": 0.0,
+            "avgBarsToEvent": 0.0,
+            "daysSpan": 0,
+            "predsPerDay": 0.0,
+        }
+    feature_cols = [col for col in FEATURE_ORDER if col in joined.columns]
+    x_vals = joined[feature_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
+    prob_long = model_long.predict_proba(x_vals) if model_long is not None else None
+    prob_short = model_short.predict_proba(x_vals) if model_short is not None else None
+    if prob_long is None and prob_short is None:
+        raise RuntimeError("At least one model is required for simulation.")
+    pred_count = 0
+    eval_count = 0
+    ok_count = 0
+    nok_count = 0
+    bars_to_event: list[int] = []
+    pending: dict[str, object] | None = None
+    out_pred_path.parent.mkdir(parents=True, exist_ok=True)
+    prev_close_time = None
+    with out_pred_path.open("w", encoding="utf-8") as handle:
+        for idx, row in joined.iterrows():
+            close_time = int(row["closeTimeMs"])
+            if prev_close_time is not None and close_time - prev_close_time != GAP_MS:
+                pending = None
+                prev_close_time = close_time
+                continue
+            prev_close_time = close_time
+            high = float(row["high"])
+            low = float(row["low"])
+            close = float(row["close"])
+            if pending is not None:
+                hit_tp = False
+                hit_sl = False
+                if pending["direction"] == "UP":
+                    hit_tp = high >= pending["tpPrice"]
+                    hit_sl = low <= pending["slPrice"]
+                else:
+                    hit_tp = low <= pending["tpPrice"]
+                    hit_sl = high >= pending["slPrice"]
+                if hit_tp or hit_sl:
+                    event = "TP_HIT"
+                    result = "OK"
+                    if hit_sl:
+                        event = "SL_HIT"
+                        result = "NOK"
+                    if hit_tp and hit_sl:
+                        event = "SL_HIT_SAME_BAR"
+                        result = "NOK"
+                    eval_record = {
+                        "type": "EVAL",
+                        "symbol": symbol,
+                        "tf": row.get("tf"),
+                        "predCloseTimeMs": pending["predCloseTimeMs"],
+                        "eventCloseTimeMs": close_time,
+                        "direction": pending["direction"],
+                        "result": result,
+                        "event": event,
+                        "entryPrice": pending["entry"],
+                        "tpPrice": pending["tpPrice"],
+                        "slPrice": pending["slPrice"],
+                    }
+                    handle.write(json.dumps(eval_record, ensure_ascii=False) + "\n")
+                    eval_count += 1
+                    if result == "OK":
+                        ok_count += 1
+                    else:
+                        nok_count += 1
+                    bars_to_event.append(horizon_bars - pending["barsLeft"] + 1)
+                    pending = None
+                    continue
+                pending["barsLeft"] -= 1
+                if pending["barsLeft"] <= 0:
+                    pending = None
+                continue
+            row_index = joined.index.get_loc(idx)
+            if prob_long is not None:
+                p_long_hit = float(prob_long[row_index][1])
+            else:
+                p_long_hit = 0.0
+            if prob_short is not None:
+                p_short_hit = float(prob_short[row_index][1])
+            else:
+                p_short_hit = 0.0
+            if model_short is None:
+                p_hit = p_long_hit
+                direction = "UP" if p_hit >= 0.5 else "DOWN"
+            else:
+                p_hit = max(p_long_hit, p_short_hit)
+                direction = "UP" if p_long_hit >= p_short_hit else "DOWN"
+            if p_hit < p_trade:
+                continue
+            tp_price = close * (1.0 + TP_PCT) if direction == "UP" else close * (1.0 - TP_PCT)
+            sl_price = close * (1.0 - SL_PCT) if direction == "UP" else close * (1.0 + SL_PCT)
+            pred_record = {
+                "type": "PRED",
+                "symbol": symbol,
+                "tf": row.get("tf"),
+                "closeTimeMs": close_time,
+                "closeTime": format_ms(close_time),
+                "horizonBars": horizon_bars,
+                "tpPct": TP_PCT,
+                "slPct": SL_PCT,
+                "direction": direction,
+                "entryPrice": close,
+                "tpPrice": tp_price,
+                "slPrice": sl_price,
+                "pHit": p_hit,
+                "pTrade": p_trade,
+                "confidence": max(p_hit, 1.0 - p_hit),
+            }
+            handle.write(json.dumps(pred_record, ensure_ascii=False) + "\n")
+            pred_count += 1
+            pending = {
+                "predCloseTimeMs": close_time,
+                "entry": close,
+                "direction": direction,
+                "tpPrice": tp_price,
+                "slPrice": sl_price,
+                "barsLeft": horizon_bars,
+            }
+    days_span = 0
+    if not raw_sorted.empty:
+        start_ms = int(raw_sorted["closeTimeMs"].min())
+        end_ms = int(raw_sorted["closeTimeMs"].max())
+        days_span = int(math.ceil((end_ms - start_ms + 1) / 86_400_000))
+    total_events = ok_count + nok_count
+    winrate = ok_count / total_events if total_events else 0.0
+    avg_bars = float(np.mean(bars_to_event)) if bars_to_event else 0.0
+    preds_per_day = pred_count / max(days_span, 1)
+    summary = {
+        "predCount": pred_count,
+        "evalCount": eval_count,
+        "okCount": ok_count,
+        "nokCount": nok_count,
+        "winrate": winrate,
+        "avgBarsToEvent": avg_bars,
+        "daysSpan": days_span,
+        "predsPerDay": preds_per_day,
+    }
+    print(
+        "SIM_SUMMARY symbol={} preds={} evals={} ok={} nok={} winrate={:.6f}".format(
+            symbol,
+            pred_count,
+            eval_count,
+            ok_count,
+            nok_count,
+            winrate,
+        )
+    )
+    return summary
 
 
 def build_lr_pipeline(
@@ -338,58 +593,6 @@ def build_lr_pipeline(
     return Pipeline(base_steps + [("classifier", lr)])
 
 
-def build_rf_pipeline(
-    *,
-    n_estimators: int,
-    max_depth: int,
-    min_samples_leaf: int,
-    class_weight: str | None,
-) -> Pipeline:
-    rf = RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        min_samples_leaf=min_samples_leaf,
-        class_weight=class_weight,
-        n_jobs=-1,
-        random_state=42,
-    )
-    return Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("classifier", rf),
-        ]
-    )
-
-
-def build_model(model_name: str, params: dict[str, object]):
-    if model_name == "LR":
-        return build_lr_pipeline(
-            params["solver"],
-            c_value=float(params["C"]),
-            class_weight=params["class_weight"],
-            max_iter=int(params["max_iter"]),
-            tol=float(params["tol"]),
-        )
-    if model_name == "RF":
-        return build_rf_pipeline(
-            n_estimators=int(params["n_estimators"]),
-            max_depth=int(params["max_depth"]),
-            min_samples_leaf=int(params["min_samples_leaf"]),
-            class_weight=params["class_weight"],
-        )
-    return HistGradientBoostingClassifier(
-        max_depth=int(params["max_depth"]),
-        max_iter=int(params["max_iter"]),
-        learning_rate=float(params["learning_rate"]),
-        min_samples_leaf=int(params["min_samples_leaf"]),
-        l2_regularization=float(params["l2_regularization"]),
-        early_stopping=True,
-        validation_fraction=0.1,
-        n_iter_no_change=10,
-        random_state=42,
-    )
-
-
 def export_onnx(model, feature_count: int, output_path: Path) -> tuple[list[str], list[str]]:
     initial_type = [("input", FloatTensorType([None, feature_count]))]
     onnx_model = convert_sklearn(
@@ -416,20 +619,20 @@ def write_meta(
     feature_order: list[str],
     onnx_outputs: list[str],
     prob_output_name: str | None,
+    label_type: str,
+    best_params: dict[str, object],
     val_acc_hi: float,
     val_coverage: float,
-    val_acc_all: float,
-    best_train_rows: int,
-    test_rows: int,
-    best_model: str,
-    best_params: dict[str, object],
-    conf_threshold: float,
-    target_acc: float,
-    min_coverage: float,
+    val_orders: int,
+    val_orders_per_day: float,
+    val_days: int,
+    val_rows: int,
     test_acc_hi: float,
     test_coverage: float,
-    test_acc_all: float,
-    val_rows: int,
+    test_orders: int,
+    test_orders_per_day: float,
+    test_days: int,
+    test_rows: int,
     export_fallback: bool,
 ) -> None:
     def _json_default(o):
@@ -455,26 +658,25 @@ def write_meta(
         "days": train_days,
         "trainRows": train_rows,
         "trainDays": train_days,
-        "labelType": LABEL_TYPE,
+        "labelType": label_type,
         "tpPct": TP_PCT,
         "slPct": SL_PCT,
         "maxHorizonBars": MAX_HORIZON_BARS,
         "classes": classes,
         "upClassIndex": up_class_index,
-        "bestModel": best_model,
         "bestParams": best_params,
-        "confThreshold": conf_threshold,
-        "targetAcc": target_acc,
-        "minCoverage": min_coverage,
         "valAccHi": val_acc_hi,
         "valCoverage": val_coverage,
-        "valAccAll": val_acc_all,
-        "bestTrainRows": best_train_rows,
+        "valOrders": val_orders,
+        "valOrdersPerDay": val_orders_per_day,
+        "valDaysSpan": val_days,
         "valRows": val_rows,
-        "testRows": test_rows,
         "testAccHi": test_acc_hi,
         "testCoverage": test_coverage,
-        "testAccAll": test_acc_all,
+        "testOrders": test_orders,
+        "testOrdersPerDay": test_orders_per_day,
+        "testDaysSpan": test_days,
+        "testRows": test_rows,
         "exportFallback": export_fallback,
         "onnxOutputs": onnx_outputs,
         "probOutputName": prob_output_name,
@@ -486,8 +688,8 @@ def write_meta(
     )
 
 
-def write_current(model_dir: Path, out_dir: Path, symbol: str) -> None:
-    current_dir = out_dir / symbol / "current"
+def write_current(model_dir: Path, out_dir: Path, symbol: str, variant: str) -> None:
+    current_dir = out_dir / symbol / f"current_{variant}"
     current_dir.mkdir(parents=True, exist_ok=True)
     model_src = model_dir / "model.onnx"
     meta_src = model_dir / "model_meta.json"
@@ -501,28 +703,30 @@ def write_current(model_dir: Path, out_dir: Path, symbol: str) -> None:
     meta_tmp.replace(meta_dst)
 
 
-def compute_metrics(
-    y_true: pd.Series,
-    preds: np.ndarray,
-    proba: np.ndarray,
-    *,
-    conf_threshold: float,
-) -> tuple[float, float, float, dict[str, int], float]:
-    acc_all = float(accuracy_score(y_true, preds))
-    p_hit = proba
-    confidence = np.maximum(p_hit, 1.0 - p_hit)
-    coverage_mask = confidence >= conf_threshold
-    coverage = float(np.mean(coverage_mask)) if len(confidence) else 0.0
-    if np.any(coverage_mask):
-        acc_hi = float(accuracy_score(y_true[coverage_mask], preds[coverage_mask]))
-    else:
-        acc_hi = float("nan")
-    matrix = confusion_matrix(y_true, preds, labels=[0, 1]).tolist()
-    tn, fp = matrix[0]
-    fn, tp = matrix[1]
-    confusion = {"tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn)}
-    win_rate = float(np.mean(y_true)) if len(y_true) else 0.0
-    return acc_all, coverage, acc_hi, confusion, win_rate
+def check_onnx_outputs(symbol: str, model_path: Path, x_check: np.ndarray) -> None:
+    try:
+        import onnxruntime as ort
+
+        sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        input_name = sess.get_inputs()[0].name
+        outputs = sess.run(None, {input_name: x_check})
+        if not outputs:
+            print("WARN_ONNX_MISMATCH symbol={} probShape={}".format(symbol, None))
+            return
+        prob_shape = None
+        for output in outputs:
+            arr = np.array(output)
+            if arr.ndim == 1 and arr.shape[0] == 2:
+                prob_shape = arr.shape
+                break
+            if arr.ndim == 2 and arr.shape[1] == 2:
+                prob_shape = arr.shape
+                break
+        if prob_shape is None:
+            output_shapes = [np.array(output).shape for output in outputs]
+            print("WARN_ONNX_MISMATCH symbol={} probShape={}".format(symbol, output_shapes))
+    except Exception as exc:
+        print(f"WARN_ONNX_MISMATCH symbol={symbol} error={exc}")
 
 
 def main() -> None:
@@ -547,6 +751,10 @@ def main() -> None:
         if features.empty:
             print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
             continue
+        features_filtered = features[(features["windowReady"] == True) & (features["featuresVersion"] == FEATURES_VERSION)]
+        if features_filtered.empty:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
         raw, _ = load_raw_frames(
             args.data_dir,
             symbol,
@@ -554,361 +762,290 @@ def main() -> None:
             fast_tail=args.fast_tail,
             need_rows=need_rows,
         )
-        x, y, merged, feature_order = build_training_frame(features, raw)
-        if len(x) < args.min_rows_per_symbol:
-            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} min={args.min_rows_per_symbol}")
-            continue
         if args.test_rows <= 0 or args.val_rows <= 0:
             raise RuntimeError("--test-rows and --val-rows must be > 0")
-        if len(x) <= args.test_rows + args.val_rows:
+        close_times = features_filtered["closeTimeMs"].sort_values().to_numpy()
+        if len(close_times) <= args.test_rows + args.val_rows:
             print(
-                f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} "
-                f"min={args.min_rows_per_symbol}"
+                "SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={} rows={} min={}".format(
+                    symbol, len(close_times), args.min_rows_per_symbol
+                )
             )
             continue
-        x = x.reset_index(drop=True)
-        y = y.reset_index(drop=True)
-        test_rows = args.test_rows
-        val_rows = args.val_rows
-        test_start = len(x) - test_rows
-        val_start = test_start - val_rows
-        x_train_pool = x.iloc[:val_start]
-        y_train_pool = y.iloc[:val_start]
-        x_val = x.iloc[val_start:test_start]
-        y_val = y.iloc[val_start:test_start]
-        x_test = x.iloc[test_start:]
-        y_test = y.iloc[test_start:]
-        if len(x_train_pool) > TRAIN_LIMIT:
-            x_train_pool = x_train_pool.iloc[-TRAIN_LIMIT:]
-            y_train_pool = y_train_pool.iloc[-TRAIN_LIMIT:]
-        conf_threshold = args.conf_threshold
+        test_start_idx = len(close_times) - args.test_rows
+        val_start_idx = test_start_idx - args.val_rows
+        val_start_ms = close_times[val_start_idx]
+        test_start_ms = close_times[test_start_idx]
+        train_end_ms = val_start_ms
+        val_end_ms = test_start_ms
+        raw_sorted = raw.sort_values("closeTimeMs")
+        train_raw = raw_sorted[raw_sorted["closeTimeMs"] < train_end_ms]
+        val_raw = raw_sorted[(raw_sorted["closeTimeMs"] >= val_start_ms) & (raw_sorted["closeTimeMs"] < val_end_ms)]
+        test_raw = raw_sorted[raw_sorted["closeTimeMs"] >= test_start_ms]
+        train_feat = features_filtered[features_filtered["closeTimeMs"] < train_end_ms]
+        val_feat = features_filtered[
+            (features_filtered["closeTimeMs"] >= val_start_ms) & (features_filtered["closeTimeMs"] < val_end_ms)
+        ]
+        test_feat = features_filtered[features_filtered["closeTimeMs"] >= test_start_ms]
+
+        (long_data, short_data, feature_order) = build_training_frames(features, raw)
+        x_long, y_long, close_long = long_data
+        x_short, y_short, close_short = short_data
+        if x_long.empty or x_short.empty:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
+        train_mask_long = close_long < train_end_ms
+        val_mask_long = (close_long >= val_start_ms) & (close_long < val_end_ms)
+        test_mask_long = close_long >= test_start_ms
+        train_mask_short = close_short < train_end_ms
+        val_mask_short = (close_short >= val_start_ms) & (close_short < val_end_ms)
+        test_mask_short = close_short >= test_start_ms
+        x_long_train = x_long.loc[train_mask_long]
+        y_long_train = y_long.loc[train_mask_long]
+        x_short_train = x_short.loc[train_mask_short]
+        y_short_train = y_short.loc[train_mask_short]
+        x_long_val = x_long.loc[val_mask_long]
+        y_long_val = y_long.loc[val_mask_long]
+        x_short_val = x_short.loc[val_mask_short]
+        y_short_val = y_short.loc[val_mask_short]
+        x_long_test = x_long.loc[test_mask_long]
+        y_long_test = y_long.loc[test_mask_long]
+        x_short_test = x_short.loc[test_mask_short]
+        y_short_test = y_short.loc[test_mask_short]
+        if len(x_long_train) < args.min_rows_per_symbol or len(x_short_train) < args.min_rows_per_symbol:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
+        if len(x_long_val) == 0 or len(x_short_val) == 0 or len(x_long_test) == 0 or len(x_short_test) == 0:
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
+            continue
+        if len(x_long_train) > TRAIN_LIMIT:
+            x_long_train = x_long_train.iloc[-TRAIN_LIMIT:]
+            y_long_train = y_long_train.iloc[-TRAIN_LIMIT:]
+        if len(x_short_train) > TRAIN_LIMIT:
+            x_short_train = x_short_train.iloc[-TRAIN_LIMIT:]
+            y_short_train = y_short_train.iloc[-TRAIN_LIMIT:]
         best = None
-        best_exportable = None
-        candidates = []
-        trial_candidates = []
-        if args.auto_tune:
-            lr_trials = [
-                ("LR", params)
-                for params in itertools.product(
-                    [0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
-                    [None, "balanced"],
-                    ["lbfgs", "saga"],
-                    [4000],
-                    [1e-4, 1e-3],
-                )
-            ]
-            rf_trials = [
-                ("RF", params)
-                for params in itertools.product(
-                    [200, 400],
-                    [6, 8, 10],
-                    [20, 50],
-                    [None, "balanced"],
-                )
-            ]
-            hgb_param_grid = list(
-                itertools.product(
-                    [3, 5, 7, 9],
-                    [100, 200, 400],
-                    [0.03, 0.05, 0.1],
-                    [20, 50, 100],
-                    [0.0, 0.1, 1.0],
-                )
+        lr_params = list(
+            itertools.product(
+                [0.03, 0.1, 0.3, 1.0, 3.0, 10.0],
+                [None, "balanced"],
+                ["lbfgs", "saga"],
+                [4000],
+                [1e-4, 1e-3],
             )
-            random.seed(42)
-            random.shuffle(hgb_param_grid)
-            hgb_trials = [("HGB", params) for params in hgb_param_grid[:30]]
-            trial_candidates = lr_trials + hgb_trials + rf_trials
-            if args.max_trials:
-                trial_candidates = trial_candidates[: args.max_trials]
-        else:
-            trial_candidates = [("LR", (1.0, None, "lbfgs", 4000, 1e-4))]
-        for trial_index, (model_name, params_raw) in enumerate(trial_candidates, start=1):
-            if model_name == "LR":
-                c_value, class_weight, solver, max_iter, tol = params_raw
-                params = {
-                    "C": c_value,
-                    "class_weight": class_weight,
-                    "solver": solver,
-                    "max_iter": max_iter,
-                    "tol": tol,
-                }
-                model = build_lr_pipeline(
-                    solver,
-                    c_value=c_value,
-                    class_weight=class_weight,
-                    max_iter=max_iter,
-                    tol=tol,
-                )
-            elif model_name == "RF":
-                n_estimators, max_depth, min_samples_leaf, class_weight = params_raw
-                params = {
-                    "n_estimators": n_estimators,
-                    "max_depth": max_depth,
-                    "min_samples_leaf": min_samples_leaf,
-                    "class_weight": class_weight,
-                }
-                model = build_rf_pipeline(
-                    n_estimators=n_estimators,
-                    max_depth=max_depth,
-                    min_samples_leaf=min_samples_leaf,
-                    class_weight=class_weight,
-                )
-            else:
-                max_depth, max_iter, learning_rate, min_samples_leaf, l2_regularization = params_raw
-                params = {
-                    "max_depth": max_depth,
-                    "max_iter": max_iter,
-                    "learning_rate": learning_rate,
-                    "min_samples_leaf": min_samples_leaf,
-                    "l2_regularization": l2_regularization,
-                }
-                model = build_model("HGB", params)
+        )
+        if not args.auto_tune:
+            lr_params = [(1.0, None, "lbfgs", 4000, 1e-4)]
+        if args.max_trials:
+            lr_params = lr_params[: args.max_trials]
+        for trial_index, params_raw in enumerate(lr_params, start=1):
+            c_value, class_weight, solver, max_iter, tol = params_raw
+            params = {
+                "C": c_value,
+                "class_weight": class_weight,
+                "solver": solver,
+                "max_iter": max_iter,
+                "tol": tol,
+            }
+            model_long = build_lr_pipeline(
+                solver,
+                c_value=c_value,
+                class_weight=class_weight,
+                max_iter=max_iter,
+                tol=tol,
+            )
+            model_short = build_lr_pipeline(
+                solver,
+                c_value=c_value,
+                class_weight=class_weight,
+                max_iter=max_iter,
+                tol=tol,
+            )
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ConvergenceWarning)
-                model.fit(x_train_pool, y_train_pool)
+                model_long.fit(x_long_train, y_long_train)
+                model_short.fit(x_short_train, y_short_train)
             has_convergence_warning = any(
                 isinstance(warning.message, ConvergenceWarning) for warning in caught
             )
             if has_convergence_warning:
-                print(
-                    "WARN_CONVERGENCE symbol={} model={} params={}".format(symbol, model_name, params)
+                print("WARN_CONVERGENCE symbol={} params={}".format(symbol, params))
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=True) as tmp_file:
+                sim_summary = simulate_trade_only(
+                    symbol,
+                    val_raw,
+                    val_feat,
+                    model_long,
+                    model_short,
+                    Path(tmp_file.name),
+                    conf_thr=CONF_THRESHOLD,
+                    p_trade=P_TRADE,
+                    horizon_bars=MAX_HORIZON_BARS,
                 )
-            val_proba = model.predict_proba(x_val)
-            classes = list(getattr(model, "classes_", []))
-            if not classes and isinstance(model, Pipeline):
-                classes = list(model.named_steps["classifier"].classes_)
-            if 1 not in classes:
-                raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
-            pos_index = classes.index(1)
-            p_hit = val_proba[:, pos_index]
-            val_preds = model.predict(x_val)
-            acc_all, coverage, acc_hi, _, _ = compute_metrics(
-                y_val,
-                val_preds,
-                p_hit,
-                conf_threshold=conf_threshold,
-            )
+            winrate = sim_summary["winrate"]
+            preds_per_day = sim_summary["predsPerDay"]
+            preds = sim_summary["predCount"]
             print(
-                "TUNE symbol={} trial={} model={} params={} accAll={:.6f} accHi={} coverage={:.6f}".format(
+                "TUNE symbol={} trial={} params={} winrate={:.6f} preds={} predsPerDay={:.6f}".format(
                     symbol,
                     trial_index,
-                    model_name,
                     params,
-                    acc_all,
-                    "nan" if np.isnan(acc_hi) else f"{acc_hi:.6f}",
-                    coverage,
+                    winrate,
+                    preds,
+                    preds_per_day,
                 )
             )
-            score_acc_hi = -1.0 if np.isnan(acc_hi) else acc_hi
-            metric = (score_acc_hi, coverage, acc_all)
-            candidate = {
-                "metric": metric,
-                "params": params,
-                "model": model,
-                "acc_all": acc_all,
-                "coverage": coverage,
-                "acc_hi": acc_hi,
-                "trial_index": trial_index,
-                "model_name": model_name,
-            }
-            candidates.append(candidate)
+            score_win = winrate
+            metric = (score_win, preds_per_day)
             if best is None or metric > best["metric"]:
-                best = candidate
-            if model_name in {"LR", "RF"} and (best_exportable is None or metric > best_exportable["metric"]):
-                best_exportable = candidate
-            if score_acc_hi >= args.target_acc and coverage >= args.min_coverage:
+                best = {
+                    "metric": metric,
+                    "params": params,
+                    "winrate": winrate,
+                    "preds": preds,
+                    "preds_per_day": preds_per_day,
+                }
+            if winrate >= 0.65 and preds >= 500 and preds_per_day >= 7.0:
                 break
         if best is None:
-            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows={len(x)} min={args.min_rows_per_symbol}")
+            print(f"SKIP_SYMBOL_NOT_ENOUGH_DATA symbol={symbol} rows=0 min={args.min_rows_per_symbol}")
             continue
-        if (best["metric"][0] < args.target_acc or best["coverage"] < args.min_coverage) and args.auto_tune:
-            top_models = sorted(candidates, key=lambda item: item["metric"], reverse=True)[:3]
-            for candidate in top_models:
-                estimator = build_model(candidate["model_name"], candidate["params"])
-                estimator = clone(estimator)
-                calibrator = CalibratedClassifierCV(
-                    estimator=estimator, method="sigmoid", cv=TimeSeriesSplit(n_splits=3)
-                )
-                calibrator.fit(x_train_pool, y_train_pool)
-                calib_proba = calibrator.predict_proba(x_val)
-                classes = list(calibrator.classes_)
-                if 1 not in classes:
-                    raise RuntimeError(f"Class 1 missing from calibrated classes for symbol {symbol}: {classes}")
-                pos_index = classes.index(1)
-                p_hit = calib_proba[:, pos_index]
-                calib_preds = calibrator.predict(x_val)
-                acc_all, coverage, acc_hi, _, _ = compute_metrics(
-                    y_val,
-                    calib_preds,
-                    p_hit,
-                    conf_threshold=conf_threshold,
-                )
-                if (
-                    (np.isnan(candidate["acc_hi"]) or np.isnan(acc_hi) or acc_hi >= candidate["acc_hi"])
-                    and coverage >= candidate["coverage"]
-                ):
-                    score_acc_hi = -1.0 if np.isnan(acc_hi) else acc_hi
-                    metric = (score_acc_hi, coverage, acc_all)
-                    tuned = {
-                        "metric": metric,
-                        "params": candidate["params"],
-                        "model": calibrator,
-                        "acc_all": acc_all,
-                        "coverage": coverage,
-                        "acc_hi": acc_hi,
-                        "trial_index": candidate["trial_index"],
-                        "model_name": f"{candidate['model_name']}_CAL",
-                    }
-                    print(
-                        "TUNE symbol={} trial={} model={} params={} accAll={:.6f} accHi={} coverage={:.6f}".format(
-                            symbol,
-                            candidate["trial_index"],
-                            tuned["model_name"],
-                            tuned["params"],
-                            acc_all,
-                            "nan" if np.isnan(acc_hi) else f"{acc_hi:.6f}",
-                            coverage,
-                        )
-                    )
-                    if metric > best["metric"]:
-                        best = tuned
         best_params = best["params"]
-        best_model_name = best["model_name"]
-        train_val_x = pd.concat([x_train_pool, x_val], axis=0)
-        train_val_y = pd.concat([y_train_pool, y_val], axis=0)
-        if best_model_name.endswith("_CAL"):
-            base_name = best_model_name.replace("_CAL", "")
-            base_estimator = build_model(base_name, best_params)
-            final_model = CalibratedClassifierCV(
-                estimator=base_estimator, method="sigmoid", cv=TimeSeriesSplit(n_splits=3)
-            )
-        else:
-            final_model = build_model(best_model_name, best_params)
-        final_model.fit(train_val_x, train_val_y)
-        test_proba = final_model.predict_proba(x_test)
-        classes = list(getattr(final_model, "classes_", []))
-        if not classes and isinstance(final_model, Pipeline):
-            classes = list(final_model.named_steps["classifier"].classes_)
-        if 1 not in classes:
-            raise RuntimeError(f"Class 1 missing from classes for symbol {symbol}: {classes}")
-        up_class_index = classes.index(1)
-        test_p_hit = test_proba[:, up_class_index]
-        test_preds = final_model.predict(x_test)
-        test_acc_all, test_coverage, test_acc_hi, _, _ = compute_metrics(
-            y_test,
-            test_preds,
-            test_p_hit,
-            conf_threshold=conf_threshold,
+        train_long = pd.concat([x_long_train, x_long_val], axis=0)
+        train_short = pd.concat([x_short_train, x_short_val], axis=0)
+        train_long_y = pd.concat([y_long_train, y_long_val], axis=0)
+        train_short_y = pd.concat([y_short_train, y_short_val], axis=0)
+        final_long = build_lr_pipeline(
+            best_params["solver"],
+            c_value=best_params["C"],
+            class_weight=best_params["class_weight"],
+            max_iter=best_params["max_iter"],
+            tol=best_params["tol"],
+        )
+        final_short = build_lr_pipeline(
+            best_params["solver"],
+            c_value=best_params["C"],
+            class_weight=best_params["class_weight"],
+            max_iter=best_params["max_iter"],
+            tol=best_params["tol"],
+        )
+        final_long.fit(train_long, train_long_y)
+        final_short.fit(train_short, train_short_y)
+        val_sim_path = args.out_dir / symbol / "sim_val.jsonl"
+        val_summary = simulate_trade_only(
+            symbol,
+            val_raw,
+            val_feat,
+            final_long,
+            final_short,
+            val_sim_path,
+            conf_thr=CONF_THRESHOLD,
+            p_trade=P_TRADE,
+            horizon_bars=MAX_HORIZON_BARS,
+        )
+        test_sim_path = args.out_dir / symbol / "sim_test.jsonl"
+        test_summary = simulate_trade_only(
+            symbol,
+            test_raw,
+            test_feat,
+            final_long,
+            final_short,
+            test_sim_path,
+            conf_thr=CONF_THRESHOLD,
+            p_trade=P_TRADE,
+            horizon_bars=MAX_HORIZON_BARS,
         )
         print(
-            "FINAL symbol={} bestModel={} bestParams={} testAccHi={} testCoverage={:.6f}".format(
+            "FINAL symbol={} winrate={:.6f} preds={} days={} predsPerDay={:.6f}".format(
                 symbol,
-                best_model_name,
-                best_params,
-                "nan" if np.isnan(test_acc_hi) else f"{test_acc_hi:.6f}",
-                test_coverage,
+                test_summary["winrate"],
+                test_summary["predCount"],
+                test_summary["daysSpan"],
+                test_summary["predsPerDay"],
             )
         )
-        model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
-        model_dir = args.out_dir / symbol / model_version
-        export_model = final_model
-        export_fallback = False
         if args.eval_only:
             print(
                 "EVAL_ONLY symbol={} train_rows={} val_rows={} test_rows={}".format(
-                    symbol, len(train_val_x), val_rows, test_rows
+                    symbol, len(train_long), len(x_long_val), len(x_long_test)
                 )
             )
             continue
-        try:
-            input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
-            print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
-        except Exception as exc:
-            print(f"ONNX_EXPORT_FAILED symbol={symbol} error=({exc}); fallback: export base model.")
-            if best_model_name.startswith("HGB") and best_exportable is not None:
-                export_model = build_model(best_exportable["model_name"], best_exportable["params"])
-                export_model.fit(train_val_x, train_val_y)
-                export_fallback = True
-            else:
-                export_model = final_model
-            input_names, output_names = export_onnx(export_model, x.shape[1], model_dir / "model.onnx")
-            print(f"ONNX_EXPORT symbol={symbol} inputs={input_names} outputs={output_names}")
-        prob_output_name = "probabilities" if "probabilities" in output_names else None
-        onnx_checked = True
-        if onnx_checked:
-            try:
-                import onnxruntime as ort
-
-                sess = ort.InferenceSession(str(model_dir / "model.onnx"), providers=["CPUExecutionProvider"])
-                input_name = sess.get_inputs()[0].name
-                x_check = x.iloc[:256].to_numpy(dtype=np.float32)
-                outputs = sess.run(None, {input_name: x_check})
-                if outputs:
-                    prob_output = None
-                    label_output = None
-                    for output in outputs:
-                        arr = np.array(output)
-                        if arr.ndim == 1 and arr.shape[0] == 2:
-                            prob_output = arr
-                        elif arr.ndim == 2 and arr.shape[1] == 2:
-                            prob_output = arr
-                        elif arr.ndim == 1 or arr.ndim == 2:
-                            label_output = arr
-                    if prob_output is None:
-                        print(f"WARN_ONNX_MISMATCH symbol={symbol} reason=missing_probabilities")
-                    else:
-                        if prob_output.ndim == 1:
-                            p_hit = float(prob_output[1])
-                            mean_conf = float(np.max(prob_output))
-                        else:
-                            p_hit = float(prob_output[0, 1])
-                            mean_conf = float(np.mean(np.max(prob_output, axis=1)))
-                        print(f"ONNX_CHECK symbol={symbol} meanMaxProb={mean_conf:.6f}")
-                        print(f"PRED symbol={symbol} pHit={p_hit:.6f}")
-                    if label_output is not None and label_output.ndim == 2 and label_output.shape[1] == 1:
-                        _ = label_output.ravel()
-                else:
-                    print(f"WARN_ONNX_MISMATCH symbol={symbol} reason=no_outputs")
-            except Exception as exc:
-                print(f"WARN_ONNX_MISMATCH symbol={symbol} error={exc}")
+        model_version = time.strftime("%Y%m%d%H%M%S", time.gmtime())
         train_days = len(extract_dates(feature_files))
-        write_meta(
-            model_dir / "model_meta.json",
-            model_version,
-            symbol,
-            train_days,
-            len(train_val_x),
-            [int(value) for value in classes],
-            up_class_index,
-            feature_order,
-            output_names,
-            prob_output_name,
-            0.0 if np.isnan(best["acc_hi"]) else float(best["acc_hi"]),
-            float(best["coverage"]),
-            float(best["acc_all"]),
-            len(train_val_x),
-            test_rows,
-            best_model_name,
-            best_params,
-            conf_threshold,
-            args.target_acc,
-            args.min_coverage,
-            0.0 if np.isnan(test_acc_hi) else float(test_acc_hi),
-            float(test_coverage),
-            float(test_acc_all),
-            val_rows,
-            export_fallback,
-        )
-        write_current(model_dir, args.out_dir, symbol)
-        wrote_path = args.out_dir / symbol / "current"
-        print(
-            "TRAIN_SYMBOL symbol={} rows={} wrote={}".format(
-                symbol,
-                len(train_val_x),
-                wrote_path,
+        for side, model, label_type, classes, val_count, test_count in (
+            (
+                "long",
+                final_long,
+                "tp0_004_sl0_002_within_7_event_driven_LONG",
+                list(final_long.named_steps["classifier"].classes_),
+                len(x_long_val),
+                len(x_long_test),
+            ),
+            (
+                "short",
+                final_short,
+                "tp0_004_sl0_002_within_7_event_driven_SHORT",
+                list(final_short.named_steps["classifier"].classes_),
+                len(x_short_val),
+                len(x_short_test),
+            ),
+        ):
+            model_dir = args.out_dir / symbol / f"{model_version}_{side}"
+            input_names, output_names = export_onnx(model, len(feature_order), model_dir / "model.onnx")
+            print(
+                "ONNX_EXPORT symbol={} side={} inputs={} outputs={}".format(
+                    symbol, side, input_names, output_names
+                )
             )
-        )
+            prob_output_name = "probabilities" if "probabilities" in output_names else None
+            x_check = train_long.iloc[:256].to_numpy(dtype=np.float32)
+            check_onnx_outputs(symbol, model_dir / "model.onnx", x_check)
+            up_class_index = classes.index(1) if 1 in classes else 0
+            val_coverage = (
+                val_summary["evalCount"] / val_summary["predCount"] if val_summary["predCount"] else 0.0
+            )
+            test_coverage = (
+                test_summary["evalCount"] / test_summary["predCount"] if test_summary["predCount"] else 0.0
+            )
+            write_meta(
+                model_dir / "model_meta.json",
+                model_version,
+                symbol,
+                train_days,
+                len(train_long),
+                [int(value) for value in classes],
+                up_class_index,
+                feature_order,
+                output_names,
+                prob_output_name,
+                label_type,
+                best_params,
+                val_summary["winrate"],
+                val_coverage,
+                val_summary["predCount"],
+                val_summary["predsPerDay"],
+                val_summary["daysSpan"],
+                val_count,
+                test_summary["winrate"],
+                test_coverage,
+                test_summary["predCount"],
+                test_summary["predsPerDay"],
+                test_summary["daysSpan"],
+                test_count,
+                False,
+            )
+            write_current(model_dir, args.out_dir, symbol, side)
+            print(
+                "TRAIN_SYMBOL symbol={} side={} rows={} wrote={}".format(
+                    symbol,
+                    side,
+                    len(train_long) if side == "long" else len(train_short),
+                    args.out_dir / symbol / f"current_{side}",
+                )
+            )
 
 
 if __name__ == "__main__":

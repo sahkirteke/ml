@@ -76,7 +76,7 @@ public class PredWriter {
             return pred.getCloseTimeMs();
         }
         if (record instanceof EvalRecord eval) {
-            return eval.getPredCloseTimeMs();
+            return eval.getEventCloseTimeMs();
         }
         return System.currentTimeMillis();
     }
